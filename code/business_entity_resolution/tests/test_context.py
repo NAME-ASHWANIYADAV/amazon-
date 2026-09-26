@@ -75,6 +75,17 @@ def test_word_log_odds_and_context_features_shapes():
     assert f[2, col["xw_n_extra"]] == 0 and f[1, col["hn_neg"]] == 1.0
 
 
+def test_global_name_counts_lookup():
+    from src.context import global_name_counts
+    ns1_ptr, ns1_ids = _csr([[0], [0], [1]], np.int32)
+    nsx_ptr, nsx_ids = _csr([[0], [2], [0], [1]], np.int32)
+    tok = {"ns1_ptr": ns1_ptr, "ns1_ids": ns1_ids, "nsx_ptr": nsx_ptr, "nsx_ids": nsx_ids,
+           "flags_sx": np.array([[0, 0, 1, 0], [0, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 0]], np.float32)}
+    h1, hx, counts, empty = global_name_counts(tok)
+    assert counts(hx, h1).tolist() == [2, 0, 2, 1]        # S1s sharing each SX core name
+    assert counts(hx, hx[empty]).tolist() == [2, 0, 2, 0]  # empty-address SX sharing it
+
+
 def test_core_hash_order_free_and_empty():
     ptr, ids = _csr([[1, 2], [1, 2], [2, 3], []], np.int32)
     h = core_hash(ptr, ids)

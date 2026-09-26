@@ -212,7 +212,7 @@ def global_name_counts(tok):
             return np.zeros(len(keys), dtype=np.float32)
         pos = np.searchsorted(u, keys)
         pos = np.clip(pos, 0, len(u) - 1)
-        return np.where(u[pos] == keys, c, 0).astype(np.float32)
+        return np.where(u[pos] == keys, c[pos], 0).astype(np.float32)
 
     return h1, hx, counts, empty
 
