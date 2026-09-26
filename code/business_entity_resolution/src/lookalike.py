@@ -21,7 +21,10 @@ DISTRACTOR_SET = [1, 2, 3, 4, 5, 7, 9, 11, 13, 21]
 FAKE_WORDS = ("holding", "holdings", "group", "groupe", "participations")
 COUNTRY_WORD = {"France": "france", "India": "india"}
 NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3"]
-RULES = ("R1", "RA", "RM", "RB", "W", "RF")
+ALL_RULES = ("R1", "RA", "RM", "RB", "W", "RF")
+# default package, chosen with the sign-symmetry check on test (true +/-1..2 number typos are symmetric in V):
+# R1+RM leave +1/+2 predictions equal to -1/-2 in US and France, while RA and RF also remove true typos
+RULES = ("R1", "RM", "RB", "W")
 
 
 def _token_flags(ptr, ids, token_ids):
@@ -99,7 +102,7 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "RM": pl.col("ins") & pl.col("sim") & (pl.col("g2") >= 1) & (pl.col("g3") >= 1),
         "RB": pl.col("ins") & (pl.col("off") >= 3) & pl.col("mod") & (pl.col("sib1") == 0) & (pl.col("sibx") >= 1)
               & (pl.col("g_unmod") == 0),
-        "W": pl.col("xword") & num,
+        "W": pl.col("xword") & (pl.col("off") >= 3),   # below 3 the mirror test says these include true typos
         "RF": pl.col("unseen") & off12 & (pl.col("sib1") >= 1) & (pl.col("xleg") | pl.col("ndiff")) & ~pl.col("ldrop"),
     }
     df = df.with_columns([(e & pl.col("keep")).fill_null(False).alias(k) for k, e in exprs.items()])

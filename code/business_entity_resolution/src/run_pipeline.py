@@ -593,7 +593,7 @@ def cap_per_source(s1r, is_s3, p, mask, caps=SOURCE_CAPS):
     return out
 
 
-def _lookalike_post(split, s1r, sxr, X):
+def _lookalike_post(split, s1r, sxr, X, rules=None):
     """Returns f(p, keep) -> reject mask of the lookalike rules (src/lookalike.py) for these pairs."""
     from .features import FEATURES
     from .lookalike import NEED_COLS, extra_legal, extra_words, legal_dropped, lookalike_reject
@@ -614,7 +614,8 @@ def _lookalike_post(split, s1r, sxr, X):
     del tok, vocab
 
     def post(p, keep):
-        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen)
+        kw = {"rules": tuple(rules)} if rules else {}
+        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen, **kw)
         log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
         return rej
     return post
@@ -776,7 +777,7 @@ def stage_rethreshold(args):
         if args.shift_rule:
             reject = shift_rule_mask(X)
         if args.lookalike:
-            post = _lookalike_post("test", s1r, sxr, X)
+            post = _lookalike_post("test", s1r, sxr, X, args.rules.split(",") if args.rules else None)
         if args.caps:
             from .features import FEATURES
             names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
@@ -816,6 +817,7 @@ def main():
                     help="never match an SX shifted by a distractor offset >= 3 when copies confirm the S1 number")
     ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
     ap.add_argument("--caps", action="store_true", help="rethreshold: at most 5 S2 and 6 S3 matches per S1")
+    ap.add_argument("--rules", default="", help="lookalike rules to apply (default src/lookalike.RULES)")
     ap.add_argument("--drop-frac", type=float, default=0.0,
                     help="features: simulate this share of S1s missing (as in test) for training and V")
     args = ap.parse_args()
