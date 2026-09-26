@@ -193,9 +193,11 @@ def _pruned_candidates(split, floor, with_comp=True):
         e = pl.read_parquet(work("cand", "train_E.parquet"), columns=["s1", "sx", "cos", "cos_name"])
         parts.append(e if floor is None else e.filter(pl.col("cos") >= floor))
     allc = pl.concat(parts)
-    comp = competition_features(allc["sx"].to_numpy(), allc["cos"].to_numpy(), allc["cos_name"].to_numpy())
-    comp = comp[:cand.height]
-    del allc, parts
+    del parts
+    comp = competition_features(allc["sx"].to_numpy(), allc["cos"].to_numpy(), allc["cos_name"].to_numpy(),
+                                n_keep=cand.height)
+    del allc
+    gc.collect()
     return cand.with_columns([pl.Series(c, comp[:, i]) for i, c in enumerate(COMP_COLS)])
 
 

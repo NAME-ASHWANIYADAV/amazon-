@@ -23,8 +23,9 @@ FEATURES = FEATURES + COMP_COLS
 
 
 @numba.njit(cache=True)
-def _competition(sx, cos, name, out):
-    """Rows sorted by (sx, cos desc). out: n_other, rank, margin, n_close, margin_name, is_best."""
+def _competition(sx, cos, name, orig, n_keep, out):
+    """Rows sorted by (sx, cos desc); orig = original row index. Writes out[orig] for orig < n_keep.
+    out columns: n_other, rank, margin, n_close, margin_name, is_best."""
     n = len(sx)
     i = 0
     while i < n:
@@ -44,25 +45,29 @@ def _competition(sx, cos, name, out):
             thr = cos[t] - 0.02
             while e < j and cos[e] >= thr:
                 e += 1
+            o = orig[t]
+            if o >= n_keep:
+                continue
             other_name = b2 if t == b1i else b1
-            out[t, 0] = g - 1
-            out[t, 1] = t - i
-            out[t, 2] = cos[t] - other if other > -9.0 else 1.0
-            out[t, 3] = e - i - 1
-            out[t, 4] = name[t] - other_name if other_name > -9.0 else 1.0
-            out[t, 5] = 1.0 if t == i else 0.0
+            out[o, 0] = g - 1
+            out[o, 1] = t - i
+            out[o, 2] = cos[t] - other if other > -9.0 else 1.0
+            out[o, 3] = e - i - 1
+            out[o, 4] = name[t] - other_name if other_name > -9.0 else 1.0
+            out[o, 5] = 1.0 if t == i else 0.0
         i = j
 
 
-def competition_features(sx, cos, cos_name):
-    """COMP_COLS for every row (row order preserved). Must be given ALL candidate rows of the split,
-    i.e. every S1's list, so that each SX sees all of its competing S1s."""
+def competition_features(sx, cos, cos_name, n_keep=None):
+    """COMP_COLS for rows [0, n_keep) (original order). Must be given ALL candidate rows of the split,
+    i.e. every S1's list, so that each SX sees all of its competing S1s; rows >= n_keep only act as
+    competitors (keeps the output small when extra competitor lists are appended)."""
+    n_keep = len(sx) if n_keep is None else n_keep
     order = np.lexsort((-cos, sx))
-    out = np.zeros((len(sx), len(COMP_COLS)), dtype=np.float32)
-    _competition(sx[order], cos[order].astype(np.float32), cos_name[order].astype(np.float32), out)
-    res = np.empty_like(out)
-    res[order] = out
-    return res
+    out = np.zeros((n_keep, len(COMP_COLS)), dtype=np.float32)
+    _competition(sx[order], cos[order].astype(np.float32), cos_name[order].astype(np.float32), order,
+                 n_keep, out)
+    return out
 
 
 def _token_csr(strings, vocab, skip_digits=False):
