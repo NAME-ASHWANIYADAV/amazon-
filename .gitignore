@@ -1,0 +1,7 @@
+# large inputs / generated outputs
+*.zip
+output/*.tsv
+student_resource/dataset/
+# python
+__pycache__/
+*.pyc
