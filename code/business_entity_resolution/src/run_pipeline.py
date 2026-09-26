@@ -576,11 +576,52 @@ def shift_rule_mask(X):
     return (M[:, 0] > 0.5) & (M[:, 1] >= 3) & (M[:, 2] >= 1)
 
 
-def _decide(s1r, sxr, p, decision, s1_country=None, reject=None):
+SOURCE_CAPS = (5, 6)   # train truth: at most 5 copies from S2 and 6 from S3 per S1, no exception in 2.2M S1
+
+
+def cap_per_source(s1r, is_s3, p, mask, caps=SOURCE_CAPS):
+    """Keep at most caps[0] S2 and caps[1] S3 matches per S1 (highest p first)."""
+    idx = np.flatnonzero(mask)
+    src = is_s3[idx].astype(np.int64)
+    order = np.lexsort((-p[idx], src, s1r[idx]))
+    g = s1r[idx][order] * 2 + src[order]
+    start = np.r_[True, g[1:] != g[:-1]]
+    rank = np.arange(len(g)) - np.maximum.accumulate(np.where(start, np.arange(len(g)), 0))
+    limit = np.where(src[order] == 1, caps[1], caps[0])
+    out = mask.copy()
+    out[idx[order][rank >= limit]] = False
+    return out
+
+
+def _lookalike_post(split, s1r, sxr, X):
+    """Returns f(p, keep) -> reject mask of the lookalike rules (src/lookalike.py) for these pairs."""
+    from .features import FEATURES
+    from .lookalike import NEED_COLS, extra_legal, extra_words, lookalike_reject
+    names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
+    M = np.asarray(X[:, [names.index(c) for c in NEED_COLS]], dtype=np.float32)
+    cols = {c: M[:, i] for i, c in enumerate(NEED_COLS)}
+    s1 = load_prep(split, "s1", ["legal", "country"])
+    xleg = extra_legal(s1["legal"].to_list(), load_prep(split, "sx", ["legal"])["legal"].to_list(), s1r, sxr)
+    with np.load(work("tok", f"{split}.npz")) as z:
+        tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
+    vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
+    xword = extra_words(tok, vocab, s1r, sxr, s1["country"].to_numpy()[s1r])
+    del tok, vocab
+
+    def post(p, keep):
+        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword)
+        log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
+        return rej
+    return post
+
+
+def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s3=None):
     """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
     overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array).
     decision["country_shift"] (optional, any rule) adds a logit shift to the named countries' p first.
-    reject (optional bool per pair): pairs that are never matched (p set to 0 before assignment)."""
+    reject (optional bool per pair): pairs that are never matched (p set to 0 before assignment).
+    post (optional f(p, keep) -> bool per pair): pairs dropped after assignment, before the cut.
+    is_s3 (optional bool per pair): enables the per-source caps after the cut."""
     from .decide import assign_best, expected_f05_cut, threshold_cut
     if reject is not None:
         p = np.where(reject, np.float32(0), np.asarray(p, dtype=np.float32))
@@ -593,6 +634,8 @@ def _decide(s1r, sxr, p, decision, s1_country=None, reject=None):
             z = np.log(np.clip(p[m], 1e-6, 1 - 1e-6) / np.clip(1 - p[m], 1e-6, 1)) + d
             p[m] = 1.0 / (1.0 + np.exp(-z))
     keep = assign_best(sxr, p)
+    if post is not None:
+        keep &= ~post(p, keep)
     mask = np.zeros(len(p), dtype=bool)
     idx = np.flatnonzero(keep)
     if decision["rule"] == "expected_f":
@@ -603,6 +646,10 @@ def _decide(s1r, sxr, p, decision, s1_country=None, reject=None):
             thr[s1_country[s1r[idx]] == c] = t
         sub = threshold_cut(p[idx], thr)
     mask[idx[sub]] = True
+    if is_s3 is not None:
+        capped = cap_per_source(s1r, is_s3, p, mask)
+        log("per-source caps removed", int(mask.sum() - capped.sum()))
+        mask = capped
     return mask
 
 
@@ -717,13 +764,21 @@ def stage_rethreshold(args):
     scored = pl.read_parquet(work("pred", "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
     s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
     del scored
-    reject = None
-    if args.shift_rule:   # test.npy rows are aligned with the scored pairs (both in predict-test order)
+    reject, post, is_s3 = None, None, None
+    if args.shift_rule or args.lookalike or args.caps:  # test.npy rows are aligned with the scored pairs
         X = np.load(work("feat", "test.npy"), mmap_mode="r")
         assert X.shape[0] == len(p), "feat/test.npy is not from the run that scored these pairs"
-        reject = shift_rule_mask(X)
+        if args.shift_rule:
+            reject = shift_rule_mask(X)
+        if args.lookalike:
+            post = _lookalike_post("test", s1r, sxr, X)
+        if args.caps:
+            from .features import FEATURES
+            names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
+            is_s3 = np.asarray(X[:, names.index("is_s3")]) > 0.5
         del X
-    mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject)
+    mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject, post=post,
+                   is_s3=is_s3)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -754,6 +809,8 @@ def main():
     ap.add_argument("--stage2", action="store_true", help="rethreshold: use the stage-2 probabilities")
     ap.add_argument("--shift-rule", action="store_true",
                     help="never match an SX shifted by a distractor offset >= 3 when copies confirm the S1 number")
+    ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
+    ap.add_argument("--caps", action="store_true", help="rethreshold: at most 5 S2 and 6 S3 matches per S1")
     ap.add_argument("--drop-frac", type=float, default=0.0,
                     help="features: simulate this share of S1s missing (as in test) for training and V")
     args = ap.parse_args()

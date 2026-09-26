@@ -40,3 +40,21 @@ def test_decide_reject_never_matches():
     got = _decide(s1r, sxr, p, {"rule": "threshold", "threshold": 0.5}, np.array(["US"]),
                   reject=np.array([False, True]))
     assert got.tolist() == [True, False] and p.tolist()[1] == np.float32(0.95)
+
+
+def test_cap_per_source_keeps_top_p_per_source():
+    from src.run_pipeline import cap_per_source
+    s1r = np.zeros(8, np.int64)
+    is_s3 = np.array([0] * 7 + [1], bool)            # seven S2 matches, one S3
+    p = np.array([.9, .8, .95, .7, .6, .85, .5, .4], np.float32)
+    mask = np.ones(8, bool)
+    got = cap_per_source(s1r, is_s3, p, mask, caps=(5, 6))
+    assert got.tolist() == [True, True, True, True, False, True, False, True]   # the two lowest S2 go
+
+
+def test_decide_post_rejects_after_assignment():
+    s1r, sxr = np.array([0, 1]), np.array([10, 10])     # one SX claimed by two S1s
+    p = np.array([0.9, 0.8], dtype=np.float32)
+    got = _decide(s1r, sxr, p, {"rule": "threshold", "threshold": 0.5}, np.array(["US", "US"]),
+                  post=lambda pp, keep: keep)          # reject whatever was assigned
+    assert got.tolist() == [False, False]              # the SX does not flow to the second S1

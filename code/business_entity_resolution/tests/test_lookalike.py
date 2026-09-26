@@ -1,0 +1,44 @@
+import numpy as np
+
+from src.lookalike import extra_legal, lookalike_reject
+
+
+def _cols(off, ins, sib1, sibx, s3, xw=None):
+    n = len(off)
+    return {"hn_off": np.array(off, np.float32), "hn_in_set": np.array(ins, np.float32),
+            "hn_sib_1": np.array(sib1, np.float32), "hn_sib_x": np.array(sibx, np.float32),
+            "cos_name": np.full(n, 0.9, np.float32), "xw_n_extra": np.array(xw or [0] * n, np.float32),
+            "is_s3": np.array(s3, np.float32)}
+
+
+def test_r1_same_source_conflict_takes_the_whole_group():
+    # one S1: anchors at the S1 number from S2 and S3, a +1 group (S2 + S3), a +7 single, a word fake
+    s1r = np.zeros(6, np.int64)
+    p = np.array([.99, .98, .9, .85, .8, .9], np.float32)
+    keep = np.ones(6, bool)
+    cols = _cols(off=[0, 0, 1, 1, 7, 0], ins=[0, 0, 1, 1, 1, 0], sib1=[1, 1, 2, 2, 2, 2], sibx=[0, 0, 1, 1, 0, 0],
+                 s3=[0, 1, 0, 1, 0, 0])
+    xword = np.array([0, 0, 0, 0, 0, 1], bool)
+    rej, m = lookalike_reject(s1r, p, keep, cols, np.zeros(6, bool), xword)
+    assert m["R1"].tolist() == [False, False, True, True, False, False]
+    assert m["RM"].tolist() == [False, False, True, True, False, False]   # the +1 group mixes S2 and S3
+    assert m["W"].tolist() == [False] * 5 + [True]
+    assert rej.tolist() == [False, False, True, True, False, True]
+
+
+def test_ra_needs_every_group_member_modified():
+    s1r = np.zeros(3, np.int64)
+    p = np.array([.99, .9, .9], np.float32)
+    keep = np.ones(3, bool)
+    cols = _cols(off=[0, 2, 2], ins=[0, 1, 1], sib1=[0, 1, 1], sibx=[0, 1, 1], s3=[1, 0, 0])
+    xleg = np.array([False, True, False])     # one member of the +2 group is an unmodified name -> RA stays off
+    _, m = lookalike_reject(s1r, p, keep, cols, xleg, np.zeros(3, bool), rules=("RA",))
+    assert not m["RA"].any()
+    xleg = np.array([False, True, True])
+    _, m = lookalike_reject(s1r, p, keep, cols, xleg, np.zeros(3, bool), rules=("RA",))
+    assert m["RA"].tolist() == [False, True, True]
+
+
+def test_extra_legal():
+    got = extra_legal(["", "llc"], ["inc", "llc", ""], np.array([0, 1, 1]), np.array([0, 1, 0]))
+    assert got.tolist() == [True, False, True]
