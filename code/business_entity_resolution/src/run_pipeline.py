@@ -108,7 +108,7 @@ def stage_candidates(args):
     else:
         q_rows = np.arange(s1.height)
     cand = build_candidates(s1["country"].to_numpy(), sx["country"].to_numpy(), q_rows, s1_emb, sx_emb,
-                            config.TOP_K, sx_addr_empty=sx["addr_empty"].to_numpy(), log=log)
+                            config.TOP_K, sx_addr_empty=sx["addr_empty"].to_numpy(), k_addr=args.k_addr, log=log)
     cand.write_parquet(work("cand", f"{args.split}.parquet"))
     log("candidates", cand.shape)
     if args.split == "train":
@@ -355,6 +355,7 @@ def main():
     ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--floor", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--k-addr", type=int, default=0, help="extra neighbours by address cosine (candidates)")
     ap.add_argument("--rule", default="threshold", choices=["threshold", "expected_f"])
     ap.add_argument("--thr", type=float, default=None)
     args = ap.parse_args()

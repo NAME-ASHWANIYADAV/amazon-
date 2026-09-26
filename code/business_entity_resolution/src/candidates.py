@@ -16,10 +16,13 @@ def _half_cos(q, d):
 
 
 @torch.no_grad()
-def knn(q_emb, d_emb, k, d_scale=None, q_chunk=1024, d_block=250_000):
-    """Top-k SX per query by record cosine. `d_scale` (per SX row) rescales records before the dot
-    product: an empty-address SX has vector [name, 0], whose cosine with a full S1 record is capped at
-    1/sqrt(2); scaling it by sqrt(2) puts it on the same 0..1 scale as full records (cos = cos_name)."""
+def knn(q_emb, d_emb, k, d_scale=None, by="record", q_chunk=1024, d_block=250_000):
+    """Top-k SX per query, ranked by record cosine (by="record") or address-half cosine (by="addr").
+
+    `d_scale` (per SX row) rescales records before the dot product: an empty-address SX has vector
+    [name, 0], whose cosine with a full S1 record is capped at 1/sqrt(2); scaling it by sqrt(2) puts it
+    on the same 0..1 scale as full records (cos = cos_name). The returned `cos` is always the record
+    cosine; `cos_name` / `cos_addr` are the half cosines of the kept neighbours."""
     D = torch.from_numpy(np.ascontiguousarray(d_emb)).to(DEVICE)  # float16 on GPU
     if d_scale is not None:
         D *= torch.from_numpy(np.asarray(d_scale, dtype=np.float16)).to(DEVICE).unsqueeze(1)
@@ -29,11 +32,14 @@ def knn(q_emb, d_emb, k, d_scale=None, q_chunk=1024, d_block=250_000):
     out_idx = np.empty((nq, k), dtype=np.int64)
     for s in range(0, nq, q_chunk):
         Q = torch.from_numpy(np.asarray(q_emb[s:s + q_chunk], dtype=np.float32)).to(DEVICE)
+        Qr = Q if by == "record" else torch.nn.functional.normalize(Q[:, EMB_DIM:], dim=1)
         best_v = torch.full((len(Q), k), -2.0, device=DEVICE)
         best_i = torch.zeros((len(Q), k), dtype=torch.int64, device=DEVICE)
         for b in range(0, len(D), d_block):
             blk = D[b:b + d_block].float()
-            sims = Q @ blk.T
+            if by == "addr":
+                blk = torch.nn.functional.normalize(blk[:, EMB_DIM:], dim=1)
+            sims = Qr @ blk.T
             del blk
             v, i = sims.topk(min(k, sims.shape[1]), dim=1)
             del sims  # free before the next block's matmul: keeps one sims buffer alive, not two
@@ -42,7 +48,7 @@ def knn(q_emb, d_emb, k, d_scale=None, q_chunk=1024, d_block=250_000):
             best_i = i.gather(1, pos)
             del v, i, pos
         Dk = D[best_i].float()
-        out["cos"][s:s + len(Q)] = best_v.cpu().numpy()
+        out["cos"][s:s + len(Q)] = (Q.unsqueeze(1) * Dk).sum(-1).cpu().numpy()
         out["cos_name"][s:s + len(Q)] = _half_cos(Q[:, :EMB_DIM], Dk[..., :EMB_DIM]).cpu().numpy()
         out["cos_addr"][s:s + len(Q)] = _half_cos(Q[:, EMB_DIM:], Dk[..., EMB_DIM:]).cpu().numpy()
         out_idx[s:s + len(Q)] = best_i.cpu().numpy()
@@ -51,21 +57,43 @@ def knn(q_emb, d_emb, k, d_scale=None, q_chunk=1024, d_block=250_000):
     return out_idx, out["cos"], out["cos_name"], out["cos_addr"]
 
 
-def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, sx_addr_empty=None, log=print):
-    """kNN per country for the S1 rows in q_rows. Returns a polars frame sorted by (s1, rank)."""
+def _pairs_frame(qr, dr, idx, cos, cn, ca):
+    kk = idx.shape[1]
+    return pl.DataFrame({"s1": np.repeat(qr, kk).astype(np.int32), "sx": dr[idx.ravel()].astype(np.int32),
+                         "cos": cos.ravel(), "cos_name": cn.ravel(), "cos_addr": ca.ravel()})
+
+
+def rank_by_cos(cand):
+    """Sort by (s1, cos desc) and number candidates 0.. within each S1 (numpy, no window functions)."""
+    cand = cand.sort(["s1", "cos"], descending=[False, True])
+    s1 = cand["s1"].to_numpy()
+    starts = np.flatnonzero(np.r_[True, s1[1:] != s1[:-1]])
+    counts = np.diff(np.r_[starts, len(s1)])
+    rank = (np.arange(len(s1)) - np.repeat(starts, counts)).astype(np.int16)
+    return cand.with_columns(pl.Series("rank", rank))
+
+
+def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, sx_addr_empty=None, k_addr=0,
+                     log=print):
+    """kNN per country for the S1 rows in q_rows: top-k by record cosine, plus (k_addr > 0) the top-k_addr
+    by address cosine, which recovers matches whose name is an unrelated trade name. Returns a polars
+    frame of unique (s1, sx) pairs sorted by (s1, rank), rank ordered by record cosine."""
     frames = []
     for c in sorted(set(s1_country[q_rows].tolist())):
         qr = q_rows[s1_country[q_rows] == c]
         dr = np.flatnonzero(sx_country == c)
         log(f"knn {c}: {len(qr)} queries x {len(dr)} records")
         scale = None if sx_addr_empty is None else np.where(sx_addr_empty[dr], np.sqrt(2.0), 1.0)
-        idx, cos, cn, ca = knn(s1_emb[qr], sx_emb[dr], k, d_scale=scale)
-        kk = idx.shape[1]
-        frames.append(pl.DataFrame({
-            "s1": np.repeat(qr, kk).astype(np.int32), "sx": dr[idx.ravel()].astype(np.int32),
-            "cos": cos.ravel(), "cos_name": cn.ravel(), "cos_addr": ca.ravel(),
-            "rank": np.tile(np.arange(kk, dtype=np.int16), len(qr))}))
-    return pl.concat(frames).sort("s1", "rank")
+        q, d = s1_emb[qr], sx_emb[dr]
+        frames.append(_pairs_frame(qr, dr, *knn(q, d, k, d_scale=scale)))
+        if k_addr:
+            log(f"knn {c}: address pass top-{k_addr}")
+            frames.append(_pairs_frame(qr, dr, *knn(q, d, k_addr, d_scale=scale, by="addr")))
+        del q, d
+    cand = pl.concat(frames)
+    if k_addr:
+        cand = cand.unique(["s1", "sx"], keep="first")
+    return rank_by_cos(cand)
 
 
 def recall_report(cand, gt_rows, s1_rows, log=print):
