@@ -159,32 +159,56 @@ def _cp(scorer, a, b):
     return process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32) / 100.0
 
 
+def build_token_arrays(load_col, log=print):
+    """Per-record structures for one split, built one column at a time to bound peak memory.
+
+    load_col(which, column) returns a list (string columns) or numpy array for which in {"s1", "sx"}.
+    Returns a dict of numpy arrays (save with np.savez, reload with load_token_arrays)."""
+    import gc
+    tok = {}
+    for field, col, skip in (("n", "name_core", False), ("a", "addr_norm", True)):
+        vocab = {}
+        for which in ("s1", "sx"):
+            tok[f"{field}{which}_ptr"], tok[f"{field}{which}_ids"] = _token_csr(load_col(which, col), vocab,
+                                                                                 skip_digits=skip)
+            gc.collect()
+        n_docs = len(tok[f"{field}sx_ptr"]) - 1
+        df = np.bincount(tok[f"{field}sx_ids"], minlength=len(vocab)).astype(np.float32)
+        tok[f"idf_{field}"] = (np.log((n_docs + 1) / (df + 1)) + 1.0).astype(np.float32)
+        log(f"tokens {col}: vocab {len(vocab)}")
+        del vocab
+        gc.collect()
+    for which in ("s1", "sx"):
+        tok[f"num{which}_ptr"], tok[f"num{which}_val"] = _number_csr(load_col(which, "numbers"))
+    l1, lx = load_col("s1", "legal"), load_col("sx", "legal")
+    uniq = sorted(set(l1) | set(lx))
+    code = {u: i for i, u in enumerate(uniq)}
+    tok["legal_M"] = _legal_matrix(uniq)
+    tok["legal_s1"] = np.array([code[u] for u in l1], dtype=np.int32)
+    tok["legal_sx"] = np.array([code[u] for u in lx], dtype=np.int32)
+    del l1, lx
+    tok["flags_sx"] = np.stack([load_col("sx", c) for c in ("was_indic", "is_domain", "addr_empty")]
+                               + [load_col("sx", "src") == 3], 1).astype(np.float32)
+    return tok
+
+
+def load_token_arrays(path):
+    with np.load(path) as z:
+        return {k: z[k] for k in z.files}
+
+
 class PairFeaturizer:
-    """Holds per-record token structures for one split; computes features for candidate chunks."""
+    """Computes features for candidate chunks from precomputed token arrays (build_token_arrays) plus
+    the string columns rapidfuzz needs: s1[name_core, addr_norm], sx[name_core, alt_core, addr_norm]."""
 
-    def __init__(self, s1, sx):
+    def __init__(self, s1, sx, tok):
         self.s1, self.sx = s1, sx
-        vocab_n, vocab_a = {}, {}
-        self.n1 = _token_csr(s1["name_core"].to_list(), vocab_n)
-        self.nx = _token_csr(sx["name_core"].to_list(), vocab_n)
-        self.a1 = _token_csr(s1["addr_norm"].to_list(), vocab_a, skip_digits=True)
-        self.ax = _token_csr(sx["addr_norm"].to_list(), vocab_a, skip_digits=True)
-        self.num1 = _number_csr(s1["numbers"].to_list())
-        self.numx = _number_csr(sx["numbers"].to_list())
-        self.idf_n = self._idf(self.nx, len(vocab_n), sx.height)
-        self.idf_a = self._idf(self.ax, len(vocab_a), sx.height)
-        uniq = sorted(set(s1["legal"].unique().to_list()) | set(sx["legal"].unique().to_list()))
-        code = {u: i for i, u in enumerate(uniq)}
-        self.legal_M = _legal_matrix(uniq)
-        self.legal1 = np.array([code[u] for u in s1["legal"].to_list()], dtype=np.int32)
-        self.legalx = np.array([code[u] for u in sx["legal"].to_list()], dtype=np.int32)
-        self.flags_x = np.stack([sx["was_indic"].to_numpy(), sx["is_domain"].to_numpy(),
-                                 sx["addr_empty"].to_numpy(), (sx["src"] == 3).to_numpy()], 1).astype(np.float32)
-
-    @staticmethod
-    def _idf(csr, n_vocab, n_docs):
-        df = np.bincount(csr[1], minlength=n_vocab).astype(np.float32)
-        return np.log((n_docs + 1) / (df + 1)).astype(np.float32) + 1.0
+        self.n1, self.nx = (tok["ns1_ptr"], tok["ns1_ids"]), (tok["nsx_ptr"], tok["nsx_ids"])
+        self.a1, self.ax = (tok["as1_ptr"], tok["as1_ids"]), (tok["asx_ptr"], tok["asx_ids"])
+        self.num1, self.numx = (tok["nums1_ptr"], tok["nums1_val"]), (tok["numsx_ptr"], tok["numsx_val"])
+        self.idf_n, self.idf_a = tok["idf_n"], tok["idf_a"]
+        self.legal_M, self.legal1, self.legalx = tok["legal_M"], tok["legal_s1"], tok["legal_sx"]
+        self.flags_x = tok["flags_sx"]
 
     def compute(self, cand):
         s1r, sxr = cand["s1"].to_numpy().astype(np.int64), cand["sx"].to_numpy().astype(np.int64)

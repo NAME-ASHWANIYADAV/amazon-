@@ -122,10 +122,30 @@ FEAT_CHUNK = 2_000_000
 
 
 def _load_split_frames(split):
-    cols = ["name_core", "legal", "alt_core", "was_indic", "is_domain", "addr_norm", "numbers", "addr_empty"]
-    s1 = load_prep(split, "s1", cols + ["entity_id", "country"] + (["part"] if split == "train" else []))
-    sx = load_prep(split, "sx", cols + ["entity_id", "src"])
+    """Only the string columns the featurizer reads directly (everything else is in the token arrays)."""
+    s1 = load_prep(split, "s1", ["name_core", "addr_norm", "entity_id", "country"]
+                   + (["part"] if split == "train" else []))
+    sx = load_prep(split, "sx", ["name_core", "alt_core", "addr_norm", "entity_id"])
     return s1, sx
+
+
+def stage_tokens(args):
+    """Token/number/legal/flag arrays for a split, one column at a time (bounded memory)."""
+    from .features import build_token_arrays
+
+    def load_col(which, col):
+        s = load_prep(args.split, which, [col])[col]
+        return s.to_list() if s.dtype == pl.Utf8 else s.to_numpy()
+
+    tok = build_token_arrays(load_col, log=log)
+    np.savez(work("tok", f"{args.split}.npz"), **tok)
+    log("tokens saved", args.split, {k: v.shape for k, v in tok.items()})
+
+
+def _featurizer(split):
+    from .features import PairFeaturizer, load_token_arrays
+    s1, sx = _load_split_frames(split)
+    return s1, sx, PairFeaturizer(s1, sx, load_token_arrays(work("tok", f"{split}.npz")))
 
 
 def _pruned_candidates(split, floor):
@@ -146,16 +166,15 @@ def _saved_floor():
 def stage_features(args):
     import json
 
-    from .features import FEATURES, PairFeaturizer
+    from .features import FEATURES
     with open(work("models", "floor.json"), "w") as f:
         json.dump({"floor": args.floor}, f)
-    s1, sx = _load_split_frames("train")
+    s1, sx, fz = _featurizer("train")
     cand = _pruned_candidates("train", args.floor)
     part = s1["part"].to_numpy()
     gt = pl.read_parquet(work("prep", "train_gt_rows.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
     cand = cand.join(gt.rename({"s1_row": "s1", "sx_row": "sx"}), on=["s1", "sx"], how="left").with_columns(
         pl.col("label").fill_null(0))
-    fz = PairFeaturizer(s1, sx)
     log("featurizer ready")
     for p in ("J", "V"):
         c = cand.filter(pl.Series(part[cand["s1"].to_numpy()] == p))
@@ -281,14 +300,12 @@ def stage_predict_test(args):
     import xgboost as xgb
 
     from . import judge
-    from .features import PairFeaturizer
     from .io_utils import write_submission
     with open(work("models", "decision.json")) as f:
         decision = json.load(f)
-    s1, sx = _load_split_frames("test")
+    s1, sx, fz = _featurizer("test")
     cand = _pruned_candidates("test", decision["floor"])
     booster = xgb.Booster(model_file=work("models", "judge_v1.json"))
-    fz = PairFeaturizer(s1, sx)
     p = np.empty(cand.height, dtype=np.float32)
     for b in range(0, cand.height, FEAT_CHUNK):
         p[b:b + FEAT_CHUNK] = judge.predict(booster, fz.compute(cand.slice(b, FEAT_CHUNK)))
@@ -328,7 +345,7 @@ def stage_rethreshold(args):
 
 
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
-          "candidates": stage_candidates, "features": stage_features, "train-judge": stage_train_judge,
+          "candidates": stage_candidates, "tokens": stage_tokens, "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
 
