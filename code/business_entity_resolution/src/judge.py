@@ -1,8 +1,11 @@
-"""XGBoost (CUDA) pair classifier."""
+"""XGBoost pair classifier (CUDA by default; ER_XGB_DEVICE=cpu when the GPU is busy with kNN)."""
+import os
+
 import numpy as np
 import xgboost as xgb
 
-PARAMS = {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist", "device": "cuda",
+PARAMS = {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist",
+          "device": os.environ.get("ER_XGB_DEVICE", "cuda"), "nthread": max(1, (os.cpu_count() or 4) - 2),
           "max_depth": 9, "eta": 0.08, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 5,
           "lambda": 1.0, "max_bin": 256}
 
