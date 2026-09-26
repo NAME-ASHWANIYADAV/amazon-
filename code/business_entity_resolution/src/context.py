@@ -13,6 +13,15 @@ import numba
 import numpy as np
 
 DISTRACTOR_SHIFTS = np.array([1, 2, 3, 4, 5, 7, 9, 11, 13, 21], dtype=np.int64)
+# French name words mapped to the English words whose extra/missing-word log-odds were learned on US/India
+# training pairs (the country name inserted into a name plays the role of 'india'). Used only when carrying
+# word log-odds to a test vocabulary; hand-written language knowledge.
+WORD_EQUIV = {"france": "india", "groupe": "group", "holding": "holdings", "fils": "sons", "freres": "brothers",
+              "cie": "co", "compagnie": "company", "associes": "associates", "centre": "center",
+              "developpement": "development", "etablissements": "enterprises", "ets": "enterprises",
+              "internationale": "international", "societe": "company", "services": "services",
+              "technologies": "technologies", "solutions": "solutions", "gestion": "management",
+              "conseil": "consulting", "partenaires": "partners", "industries": "industries"}
 NO_NUM = 999.0
 
 CTX_COLS = ["hn_off", "hn_in_set", "hn_neg", "hn_trunc", "hn_composite", "hn_sib_x", "hn_sib_1",

@@ -552,10 +552,11 @@ def stage_predict_test(args):
     lo = np.load(work("models", "word_lo_train.npz"))
     vtr = pl.read_parquet(work("tok", "train_vocab_n.parquet"))["token"].to_list()
     vte = pl.read_parquet(work("tok", "test_vocab_n.parquet"))["token"].to_list()
+    from .context import WORD_EQUIV
     lo_test = []
     for arr in (lo["extra"], lo["miss"]):
         m = dict(zip(vtr, arr.tolist()))
-        lo_test.append(np.array([m.get(t, 0.0) for t in vte], dtype=np.float32))
+        lo_test.append(np.array([m.get(t, m.get(WORD_EQUIV.get(t, t), 0.0)) for t in vte], dtype=np.float32))
     cand = _add_context(cand, tok, *lo_test)
 
     from .features import FEATURES
