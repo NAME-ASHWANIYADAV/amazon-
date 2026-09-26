@@ -32,7 +32,9 @@ python -m src.run_pipeline encode --split train             # fingerprints for t
 python -m src.run_pipeline encode --split test              # fingerprints for test records
 python -m src.run_pipeline candidates --split train         # GPU kNN for J+V S1s + recall report
 python -m src.run_pipeline candidates --split test          # GPU kNN for all test S1s
-python -m src.run_pipeline features --split train --floor F # pair features for J and V (F from the recall report)
+python -m src.run_pipeline tokens --split train             # token/number/legal arrays (bounded memory)
+python -m src.run_pipeline tokens --split test
+python -m src.run_pipeline features --split train           # pair features for J and V (optional --floor F)
 python -m src.run_pipeline train-judge                      # XGBoost on J (GPU)
 python -m src.run_pipeline validate                         # macro F0.5 on V, chooses the decision rule
 python -m src.run_pipeline predict-test                     # writes output/*.tsv and runs the validator
@@ -49,7 +51,7 @@ test probabilities with a different decision rule (no feature recomputation).
 | `src/featurize.py` | numba hashing of words + char 3/4-grams into EmbeddingBag ids |
 | `src/encoder.py` | fingerprint bi-encoder (training with in-batch InfoNCE, encoding) |
 | `src/candidates.py` | GPU brute-force cosine kNN per country, recall report |
-| `src/features.py` | 42 pair features (cosines, token sets, numbers, fuzzy scores, flags) |
+| `src/features.py` | token arrays + 44 pair features (cosines, token sets, numbers, fuzzy scores, flags) |
 | `src/judge.py` | XGBoost (CUDA) classifier |
 | `src/decide.py` | assignment (each SX to one S1), expected-F0.5 cut, threshold rule |
 | `src/evaluate.py` | organizer macro F0.5 |
