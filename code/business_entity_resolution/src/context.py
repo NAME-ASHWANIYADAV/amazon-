@@ -1,0 +1,247 @@
+"""Generator-aware context features found by error analysis on validation.
+
+- House numbers: lookalike distractors shift the S1 number UP by one of DISTRACTOR_SHIFTS; true copies
+  get symmetric +/-1..2 typos, truncations or zero padding. A shift followed by a truncation is a
+  distractor signature. When a true copy's number differs from S1, other true copies usually share it.
+- Empty-address copies: whether an empty-address record belongs to this S1 depends on how many
+  same-name empty-address records compete in the list and how common the name is globally.
+- Extra / missing name words: descriptor words (group, holdings, overseas, ...) mark lookalikes; generic
+  suffixes (center, services, ...) are true-copy noise. Scored by out-of-fold log-odds from training pairs.
+All inputs are per-record token arrays (features.build_token_arrays) and candidate-table columns.
+"""
+import numba
+import numpy as np
+
+DISTRACTOR_SHIFTS = np.array([1, 2, 3, 4, 5, 7, 9, 11, 13, 21], dtype=np.int64)
+NO_NUM = 999.0
+
+CTX_COLS = ["hn_off", "hn_in_set", "hn_neg", "hn_trunc", "hn_composite", "hn_sib_x", "hn_sib_1",
+            "emp_dup_cnt", "same_core_in_list", "far_twin_cnt", "g_n_s1_core", "g_n_sx_core",
+            "g_n_sxemp_core", "g_emp_ratio", "xw_lo_max", "xw_lo_sum", "xw_n_extra", "mw_lo_max", "mw_n_miss"]
+
+
+@numba.njit(cache=True)
+def core_hash(ptr, ids):
+    """Order-free hash of each record's (sorted, unique) name token ids; 0 for an empty name."""
+    n = len(ptr) - 1
+    out = np.zeros(n, dtype=np.int64)
+    for r in range(n):
+        h = np.uint64(1469598103934665603)
+        for k in range(ptr[r], ptr[r + 1]):
+            h = (h ^ np.uint64(ids[k] + 1)) * np.uint64(1099511628211)
+        out[r] = np.int64(h & np.uint64(0x7FFFFFFFFFFFFFFF)) if ptr[r + 1] > ptr[r] else 0
+    return out
+
+
+@numba.njit(cache=True)
+def _ndigits(v):
+    d = 1
+    while v >= 10:
+        v //= 10
+        d += 1
+    return d
+
+
+@numba.njit(cache=True)
+def _is_trunc(a, b):
+    """b is a with its last digit dropped or its leading digit dropped."""
+    if a < 10:
+        return False
+    if b == a // 10:
+        return True
+    return b == a % (10 ** (_ndigits(a) - 1))
+
+
+@numba.njit(parallel=True, cache=True)
+def number_alignment(a_ptr, a_val, b_ptr, b_val, pa, pb, shifts, off, bval, flags):
+    """Best-aligned (S1 number a, SX number b) per pair (min |b - a|).
+    off: signed b - a clipped to +/-60 (NO_NUM when a side has no numbers); bval: aligned b (-1 if none);
+    flags[:, 0] in distractor set, 1 negative, 2 truncation of a, 3 composite shift+truncation."""
+    for q in numba.prange(len(pa)):
+        i, j = pa[q], pb[q]
+        x0, x1, y0, y1 = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        if x1 == x0 or y1 == y0:
+            off[q] = NO_NUM
+            bval[q] = -1
+            continue
+        best, ba, bb = 1 << 62, 0, 0
+        for x in range(x0, x1):
+            for y in range(y0, y1):
+                d = abs(b_val[y] - a_val[x])
+                if d < best:
+                    best, ba, bb = d, a_val[x], b_val[y]
+        o = bb - ba
+        off[q] = max(-60.0, min(60.0, float(o)))
+        bval[q] = bb
+        in_set = 0.0
+        for s in shifts:
+            if o == s:
+                in_set = 1.0
+        flags[q, 0] = in_set
+        flags[q, 1] = 1.0 if o < 0 else 0.0
+        flags[q, 2] = 1.0 if (o != 0 and _is_trunc(ba, bb)) else 0.0
+        comp = 0.0
+        if o != 0:
+            for s in shifts:
+                if _is_trunc(ba + s, bb):
+                    comp = 1.0
+        flags[q, 3] = comp
+
+
+@numba.njit(cache=True)
+def list_context(s1r, off, bval, cos_name, cos_addr, sx_empty, sx_key, s1_key, out):
+    """Within each S1 list (rows grouped by s1): out columns
+    0 hn_sib_x: other name-similar rows with the same aligned SX number (-1 if no number)
+    1 hn_sib_1: other name-similar rows whose number equals the S1 number
+    2 emp_dup_cnt: empty-address rows with this row's core name (incl. itself)
+    3 same_core_in_list: rows with this row's core name
+    4 far_twin_cnt: non-empty rows named like the S1 whose address differs (cos_addr < 0.5)."""
+    n = len(s1r)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and s1r[j] == s1r[i]:
+            j += 1
+        k1 = s1_key[i]
+        far = 0
+        n_eq1 = 0
+        for u in range(i, j):
+            if sx_key[u] == k1 and sx_key[u] != 0 and not sx_empty[u] and cos_addr[u] < 0.5:
+                far += 1
+            if cos_name[u] >= 0.75 and off[u] == 0.0:
+                n_eq1 += 1
+        for t in range(i, j):
+            sib = 0
+            emp = 0
+            same = 0
+            for u in range(i, j):
+                if sx_key[u] == sx_key[t] and sx_key[t] != 0:
+                    same += 1
+                    if sx_empty[u]:
+                        emp += 1
+                if u != t and bval[t] >= 0 and bval[u] == bval[t] and cos_name[u] >= 0.75:
+                    sib += 1
+            out[t, 0] = sib if bval[t] >= 0 else -1.0
+            out[t, 1] = n_eq1 - (1 if (cos_name[t] >= 0.75 and off[t] == 0.0) else 0)
+            out[t, 2] = emp
+            out[t, 3] = same
+            out[t, 4] = far
+        i = j
+
+
+@numba.njit(parallel=True, cache=True)
+def _extra_missing(a_ptr, a_ids, b_ptr, b_ids, pa, pb, lo_extra, lo_miss, out):
+    """Sorted token-id sets A (S1) and B (SX): extra = B - A, missing = A - B.
+    out: max lo over extra, sum lo over extra, n_extra, max lo over missing, n_missing."""
+    for q in numba.prange(len(pa)):
+        i, j = pa[q], pb[q]
+        x, xe, y, ye = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        emax, esum, ne, mmax, nm = -9.0, 0.0, 0, -9.0, 0
+        while x < xe or y < ye:
+            if y >= ye or (x < xe and a_ids[x] < b_ids[y]):
+                v = lo_miss[a_ids[x]]
+                mmax = max(mmax, v)
+                nm += 1
+                x += 1
+            elif x >= xe or b_ids[y] < a_ids[x]:
+                v = lo_extra[b_ids[y]]
+                emax = max(emax, v)
+                esum += v
+                ne += 1
+                y += 1
+            else:
+                x += 1
+                y += 1
+        out[q, 0] = emax if ne > 0 else 0.0
+        out[q, 1] = esum
+        out[q, 2] = ne
+        out[q, 3] = mmax if nm > 0 else 0.0
+        out[q, 4] = nm
+
+
+@numba.njit(cache=True)
+def _extra_missing_counts(a_ptr, a_ids, b_ptr, b_ids, pa, pb, label, n_vocab, cnt):
+    """cnt[token, 0/1/2/3] = extra-in-false, extra-in-true, missing-in-false, missing-in-true."""
+    for q in range(len(pa)):
+        i, j = pa[q], pb[q]
+        x, xe, y, ye = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        lab = label[q]
+        while x < xe or y < ye:
+            if y >= ye or (x < xe and a_ids[x] < b_ids[y]):
+                cnt[a_ids[x], 2 + lab] += 1
+                x += 1
+            elif x >= xe or b_ids[y] < a_ids[x]:
+                cnt[b_ids[y], lab] += 1
+                y += 1
+            else:
+                x += 1
+                y += 1
+
+
+def word_log_odds(tok, s1r, sxr, label, min_count=5):
+    """Per-token log-odds (false vs true) of appearing as an extra SX word / a missing S1 word."""
+    n_vocab = len(tok["idf_n"])
+    cnt = np.zeros((n_vocab, 4), dtype=np.int64)
+    _extra_missing_counts(tok["ns1_ptr"], tok["ns1_ids"], tok["nsx_ptr"], tok["nsx_ids"],
+                          s1r.astype(np.int64), sxr.astype(np.int64), label.astype(np.int64), n_vocab, cnt)
+    tot = cnt.sum(0).astype(np.float64)
+
+    def lo(f, t):
+        v = np.log((cnt[:, f] + 1) / (tot[f] + 2)) - np.log((cnt[:, t] + 1) / (tot[t] + 2))
+        return np.where(cnt[:, f] + cnt[:, t] >= min_count, v, 0.0).astype(np.float32)
+
+    return lo(0, 1), lo(2, 3)
+
+
+def extra_word_features(tok, s1r, sxr, lo_extra, lo_miss):
+    out = np.zeros((len(s1r), 5), dtype=np.float32)
+    _extra_missing(tok["ns1_ptr"], tok["ns1_ids"], tok["nsx_ptr"], tok["nsx_ids"], s1r.astype(np.int64),
+                   sxr.astype(np.int64), lo_extra, lo_miss, out)
+    return out
+
+
+def global_name_counts(tok):
+    """Per-record counts over the whole split: S1s with the same core name, SX with it, empty-address SX."""
+    h1 = core_hash(tok["ns1_ptr"], tok["ns1_ids"])
+    hx = core_hash(tok["nsx_ptr"], tok["nsx_ids"])
+    empty = tok["flags_sx"][:, 2] > 0
+
+    def counts(keys, values):
+        u, c = np.unique(values, return_counts=True)
+        if len(u) == 0:
+            return np.zeros(len(keys), dtype=np.float32)
+        pos = np.searchsorted(u, keys)
+        pos = np.clip(pos, 0, len(u) - 1)
+        return np.where(u[pos] == keys, c, 0).astype(np.float32)
+
+    return h1, hx, counts, empty
+
+
+def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss):
+    """All CTX_COLS for candidate pairs grouped by s1 (s1r sorted/grouped). Returns float32 (n, len(CTX_COLS))."""
+    s1r64, sxr64 = s1r.astype(np.int64), sxr.astype(np.int64)
+    n = len(s1r64)
+    out = np.zeros((n, len(CTX_COLS)), dtype=np.float32)
+    col = {c: i for i, c in enumerate(CTX_COLS)}
+    off = np.empty(n, dtype=np.float32)
+    bval = np.empty(n, dtype=np.int64)
+    flags = np.zeros((n, 4), dtype=np.float32)
+    number_alignment(tok["nums1_ptr"], tok["nums1_val"], tok["numsx_ptr"], tok["numsx_val"], s1r64, sxr64,
+                     DISTRACTOR_SHIFTS, off, bval, flags)
+    out[:, col["hn_off"]] = off
+    out[:, col["hn_in_set"]:col["hn_composite"] + 1] = flags
+    h1, hx, counts, empty = global_name_counts(tok)
+    sx_key, s1_key = hx[sxr64], h1[s1r64]
+    lc = np.zeros((n, 5), dtype=np.float32)
+    list_context(s1r64, off, bval, cos_name.astype(np.float32), cos_addr.astype(np.float32), empty[sxr64],
+                 sx_key, s1_key, lc)
+    out[:, col["hn_sib_x"]:col["far_twin_cnt"] + 1] = lc
+    n_s1 = counts(sx_key, h1)
+    n_sx = counts(sx_key, hx)
+    n_emp = counts(sx_key, hx[empty])
+    out[:, col["g_n_s1_core"]] = n_s1
+    out[:, col["g_n_sx_core"]] = n_sx
+    out[:, col["g_n_sxemp_core"]] = n_emp
+    out[:, col["g_emp_ratio"]] = n_emp / np.maximum(n_s1, 1)
+    out[:, col["xw_lo_max"]:col["mw_n_miss"] + 1] = extra_word_features(tok, s1r64, sxr64, lo_extra, lo_miss)
+    return out

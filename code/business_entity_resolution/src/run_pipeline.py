@@ -207,18 +207,101 @@ def _saved_floor():
         return json.load(f)["floor"]
 
 
+def _with_addr_empty(cand, tok):
+    return cand.with_columns(pl.Series("addr_empty_x", tok["flags_sx"][cand["sx"].to_numpy(), 2]))
+
+
+def _stage_a_matrix(cand):
+    from .features import STAGE_A_COLS
+    return np.column_stack([cand[k].to_numpy().astype(np.float32) for k in STAGE_A_COLS])
+
+
+def _stage_a_predict(cand, models, chunk=4_000_000):
+    """Mean stage-A probability of the given models, built chunk by chunk from the table columns."""
+    from . import judge
+    out = np.empty(cand.height, dtype=np.float32)
+    for b in range(0, cand.height, chunk):
+        X = _stage_a_matrix(cand.slice(b, chunk))
+        out[b:b + chunk] = np.mean([judge.predict(m, X) for m in models], axis=0)
+    return out
+
+
+def _add_context(cand, tok, lo_extra, lo_miss):
+    """Generator-aware context columns (rows must be grouped by s1)."""
+    from .context import CTX_COLS, context_features
+    F = context_features(tok, cand["s1"].to_numpy(), cand["sx"].to_numpy(), cand["cos_name"].to_numpy(),
+                         cand["cos_addr"].to_numpy(), lo_extra, lo_miss)
+    return cand.with_columns([pl.Series(c, F[:, i]) for i, c in enumerate(CTX_COLS)])
+
+
+def stage_vocab(args):
+    """Name-token vocabulary in token-id order (needed to carry word log-odds from train to test ids)."""
+    from .features import build_vocab
+    vocab = build_vocab(load_prep(args.split, w, ["name_core"])["name_core"].to_list() for w in ("s1", "sx"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    pl.DataFrame({"token": tokens}).write_parquet(work("tok", f"{args.split}_vocab_n.parquet"))
+    log("vocab", args.split, len(tokens))
+
+
 def stage_features(args):
     import json
 
-    from .features import FEATURES
+    from . import judge
+    from .context import word_log_odds
+    from .features import FEATURES, PairFeaturizer, load_token_arrays
     with open(work("models", "floor.json"), "w") as f:
         json.dump({"floor": args.floor}, f)
-    s1, sx, fz = _featurizer("train")
+    s1, sx = _load_split_frames("train")
+    tok = load_token_arrays(work("tok", "train.npz"))
+    fz = PairFeaturizer(s1, sx, tok)
     cand = _pruned_candidates("train", args.floor)
     part = s1["part"].to_numpy()
     gt = pl.read_parquet(work("prep", "train_gt_rows.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
-    cand = cand.join(gt.rename({"s1_row": "s1", "sx_row": "sx"}), on=["s1", "sx"], how="left").with_columns(
-        pl.col("label").fill_null(0))
+    cand = (cand.join(gt.rename({"s1_row": "s1", "sx_row": "sx"}), on=["s1", "sx"], how="left")
+            .with_columns(pl.col("label").fill_null(0)).sort("s1", "rank"))
+    cand = _with_addr_empty(cand, tok)
+    log("candidates J+V", cand.height)
+
+    # ---- stage A: cheap filter on list/competition features, 2-fold out-of-fold on J
+    s1r, y = cand["s1"].to_numpy(), cand["label"].to_numpy()
+    is_j, fold = part[s1r] == "J", s1r % 2
+    models = []
+    for f in (0, 1):
+        tr = is_j & (fold == f)
+        models.append(judge.train_small(_stage_a_matrix(cand.filter(pl.Series(tr))), y[tr]))
+        models[-1].save_model(work("models", f"stage_a_{f}.json"))
+    pA = np.empty(cand.height, dtype=np.float32)
+    for f in (0, 1):  # model f scores the other fold
+        te = is_j & (fold != f)
+        pA[te] = _stage_a_predict(cand.filter(pl.Series(te)), [models[f]])
+    pA[~is_j] = _stage_a_predict(cand.filter(pl.Series(~is_j)), models)
+    t_a = float(np.quantile(pA[is_j & (y == 1)], 0.001))
+    with open(work("models", "stage_a.json"), "w") as f:
+        json.dump({"threshold": t_a}, f)
+    keep = pA >= t_a
+    for p in ("J", "V"):
+        m = part[s1r] == p
+        log(f"stage A {p}: kept {keep[m].sum()} of {m.sum()} pairs ({keep[m].sum() / len(np.unique(s1r[m])):.1f}/S1), "
+            f"true kept {(keep & m & (y == 1)).sum() / max(1, (m & (y == 1)).sum()):.4f}, threshold {t_a:.5f}")
+    cand = cand.with_columns(pl.Series("pA", pA)).filter(pl.Series(keep))
+    del pA, keep, s1r, y
+    gc.collect()
+
+    # ---- word log-odds (out-of-fold for J) and generator-aware context features
+    s1r, sxr, y = cand["s1"].to_numpy(), cand["sx"].to_numpy(), cand["label"].to_numpy()
+    is_j, fold = part[s1r] == "J", s1r % 2
+    lo = {f: word_log_odds(tok, s1r[is_j & (fold == f)], sxr[is_j & (fold == f)], y[is_j & (fold == f)])
+          for f in (0, 1)}
+    lo_full = word_log_odds(tok, s1r[is_j], sxr[is_j], y[is_j])
+    np.savez(work("models", "word_lo_train.npz"), extra=lo_full[0], miss=lo_full[1])
+    pieces = [_add_context(cand.filter(pl.Series(is_j & (fold == 0))), tok, *lo[1]),
+              _add_context(cand.filter(pl.Series(is_j & (fold == 1))), tok, *lo[0]),
+              _add_context(cand.filter(pl.Series(~is_j)), tok, *lo_full)]
+    cand = pl.concat(pieces)
+    del pieces
+    gc.collect()
     log("featurizer ready")
     for p in ("J", "V"):
         c = cand.filter(pl.Series(part[cand["s1"].to_numpy()] == p))
@@ -351,22 +434,56 @@ def stage_predict_test(args):
     import xgboost as xgb
 
     from . import judge
+    from .features import COMP_COLS, PairFeaturizer, add_list_features, competition_features, load_token_arrays
     from .io_utils import write_submission
     with open(work("models", "decision.json")) as f:
         decision = json.load(f)
-    s1, sx, fz = _featurizer("test")
-    cand = _pruned_candidates("test", decision["floor"])
+    with open(work("models", "stage_a.json")) as f:
+        t_a = json.load(f)["threshold"]
+    s1, sx = _load_split_frames("test")
+    tok = load_token_arrays(work("tok", "test.npz"))
+    country = s1["country"].to_numpy()
+    models_a = [xgb.Booster(model_file=work("models", f"stage_a_{f}.json")) for f in (0, 1)]
+
+    # list + competition features and the stage-A filter, one country at a time (bounded memory)
+    cand_all = pl.read_parquet(work("cand", "test.parquet"))
+    kept, n_before = [], cand_all.height
+    for c in sorted(set(country.tolist())):
+        cc = add_list_features(cand_all.filter(pl.Series(country[cand_all["s1"].to_numpy()] == c)))
+        comp = competition_features(cc["sx"].to_numpy(), cc["cos"].to_numpy(), cc["cos_name"].to_numpy())
+        cc = _with_addr_empty(cc.with_columns([pl.Series(k, comp[:, i]) for i, k in enumerate(COMP_COLS)]), tok)
+        pa = _stage_a_predict(cc, models_a)
+        cc = cc.with_columns(pl.Series("pA", pa)).filter(pl.col("pA") >= t_a)
+        log(f"  {c}: kept {cc.height} of {len(pa)} candidate pairs")
+        kept.append(cc)
+        del comp, pa
+    cand = pl.concat(kept).sort("s1", "rank")
+    del cand_all, kept
+    gc.collect()
+    log("stage A kept", cand.height, "of", n_before, f"({cand.height / len(country):.1f}/S1)")
+
+    # word log-odds learned on train, carried to test token ids through the vocabularies
+    lo = np.load(work("models", "word_lo_train.npz"))
+    vtr = pl.read_parquet(work("tok", "train_vocab_n.parquet"))["token"].to_list()
+    vte = pl.read_parquet(work("tok", "test_vocab_n.parquet"))["token"].to_list()
+    lo_test = []
+    for arr in (lo["extra"], lo["miss"]):
+        m = dict(zip(vtr, arr.tolist()))
+        lo_test.append(np.array([m.get(t, 0.0) for t in vte], dtype=np.float32))
+    cand = _add_context(cand, tok, *lo_test)
+
+    fz = PairFeaturizer(s1, sx, tok)
     booster = xgb.Booster(model_file=work("models", "judge_v1.json"))
     p = np.empty(cand.height, dtype=np.float32)
     for b in range(0, cand.height, FEAT_CHUNK):
         p[b:b + FEAT_CHUNK] = judge.predict(booster, fz.compute(cand.slice(b, FEAT_CHUNK)))
         log(f"  test scored {min(b + FEAT_CHUNK, cand.height)}/{cand.height}")
-    np.save(work("pred", "test_p.npy"), p)
     s1r, sxr = cand["s1"].to_numpy().copy(), cand["sx"].to_numpy().copy()
+    pl.DataFrame({"s1": s1r, "sx": sxr, "p": p}).write_parquet(work("pred", "test_pairs_p.parquet"))
     s1_ids, sx_ids = s1["entity_id"].to_list(), sx["entity_id"].to_numpy()
-    del cand, fz, s1, sx
+    del cand, fz, s1, sx, tok
     gc.collect()
-    mask = _decide(s1r, sxr, p, decision)
+    mask = _decide(s1r, sxr, p, decision, s1_country=country)
     write_submission(config.OUT_DIR, s1_ids, sx_ids, s1r, sxr, mask)
     log("matched pairs", int(mask.sum()), "S1 with >=1 match", len(np.unique(s1r[mask])), "of", len(s1_ids))
     del sx_ids, s1r, sxr, p, mask
@@ -385,10 +502,9 @@ def stage_rethreshold(args):
         decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
-    cand = _pruned_candidates("test", decision["floor"], with_comp=False)
-    p = np.load(work("pred", "test_p.npy"))
-    s1r, sxr = cand["s1"].to_numpy(), cand["sx"].to_numpy()
-    del cand
+    scored = pl.read_parquet(work("pred", "test_pairs_p.parquet"))
+    s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
+    del scored
     mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy())
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
@@ -399,6 +515,7 @@ def stage_rethreshold(args):
 
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
           "candidates": stage_candidates, "address-pass": stage_address_pass, "tokens": stage_tokens,
+          "vocab": stage_vocab,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 

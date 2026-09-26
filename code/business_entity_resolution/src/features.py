@@ -19,7 +19,25 @@ NUM_COLS = ["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "n
             "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel"]
 # Cross-S1 competition: how this S1 compares with every other S1 whose candidate list contains the same SX.
 COMP_COLS = ["comp_n_other", "comp_rank", "comp_margin", "comp_n_close", "comp_margin_name", "comp_is_best"]
-FEATURES = FEATURES + COMP_COLS
+# Features precomputed on the candidate table and copied into X: list context, competition, generator-aware
+# context (context.CTX_COLS) and the stage-A filter probability.
+from .context import CTX_COLS  # noqa: E402
+
+LIST_COLS = ["cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size"]
+STAGE_A_COLS = LIST_COLS + COMP_COLS + ["addr_empty_x"]
+FEATURES = FEATURES + COMP_COLS + CTX_COLS + ["pA"]
+TABLE_COLS = LIST_COLS + COMP_COLS + CTX_COLS + ["pA"]
+
+
+def build_vocab(strings_iter):
+    """Token -> id in exactly the order build_token_arrays assigns name ids (s1 then sx, token order)."""
+    vocab = {}
+    for strings in strings_iter:
+        for s in strings:
+            if s:
+                for t in s.split():
+                    vocab.setdefault(t, len(vocab))
+    return vocab
 
 
 @numba.njit(cache=True)
@@ -266,8 +284,8 @@ class PairFeaturizer:
         n = len(s1r)
         X = np.zeros((n, len(FEATURES)), dtype=np.float32)
         col = {f: i for i, f in enumerate(FEATURES)}
-        # list features (add_list_features) and cross-S1 competition features (competition_features)
-        for f in ["cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size"] + COMP_COLS:
+        # precomputed on the whole candidate table (list, competition, context, stage-A probability)
+        for f in TABLE_COLS:
             X[:, col[f]] = cand[f].to_numpy()
 
         o = np.zeros((n, 5), dtype=np.float32)

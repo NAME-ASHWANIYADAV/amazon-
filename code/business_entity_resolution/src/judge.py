@@ -18,9 +18,25 @@ def train(X, y, n_eval, rounds=3000):
     return xgb.train(PARAMS, dtr, rounds, evals=[(dev, "eval")], early_stopping_rounds=60, verbose_eval=100)
 
 
+A_PARAMS = {**PARAMS, "max_depth": 6, "eta": 0.15, "min_child_weight": 10}
+
+
+def train_small(X, y, rounds=250):
+    """Stage-A filter model: cheap features, fixed rounds (no early stopping)."""
+    return xgb.train(A_PARAMS, xgb.QuantileDMatrix(X, y), rounds)
+
+
+def _iteration_range(booster):
+    try:
+        return 0, booster.best_iteration + 1
+    except AttributeError:  # trained without early stopping: use every tree
+        return 0, 0
+
+
 def predict(booster, X, chunk=2_000_000):
     out = np.empty(len(X), dtype=np.float32)
+    rng = _iteration_range(booster)
     for b in range(0, len(X), chunk):
         out[b:b + chunk] = booster.inplace_predict(np.asarray(X[b:b + chunk], dtype=np.float32),
-                                                   iteration_range=(0, booster.best_iteration + 1))
+                                                   iteration_range=rng)
     return out
