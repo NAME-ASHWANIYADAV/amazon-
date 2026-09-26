@@ -217,6 +217,74 @@ def global_name_counts(tok):
     return h1, hx, counts, empty
 
 
+S2_COLS = ["p1_logit", "s2_n_conf", "s2_n_conf_nonempty", "s2_rank_p", "s2_max_other_p", "s2_nla",
+           "s2_same_core_conf", "s2_sib_conf", "s2_sum_other_p"]
+
+
+@numba.njit(cache=True)
+def _stage2(s1r, p1, sx_empty, sx_key, s1_key, bval, out):
+    """Within each S1 list (rows grouped by s1), context from stage-1 probabilities (see S2_COLS[1:])."""
+    n = len(s1r)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and s1r[j] == s1r[i]:
+            j += 1
+        nla = 0
+        for u in range(i, j):
+            if not sx_empty[u] and sx_key[u] == s1_key[u] and sx_key[u] != 0 and p1[u] < 0.5:
+                nla += 1
+        for t in range(i, j):
+            n_conf, n_conf_ne, rank, same, sib = 0, 0, 0, 0, 0
+            mx, sm = 0.0, 0.0
+            for u in range(i, j):
+                if p1[u] > p1[t]:
+                    rank += 1
+                if u == t:
+                    continue
+                sm += p1[u]
+                if p1[u] > mx:
+                    mx = p1[u]
+                if p1[u] >= 0.5:
+                    n_conf += 1
+                    if not sx_empty[u]:
+                        n_conf_ne += 1
+                    if sx_key[u] == sx_key[t] and sx_key[t] != 0:
+                        same += 1
+                    if bval[t] >= 0 and bval[u] == bval[t]:
+                        sib += 1
+            out[t, 0] = n_conf
+            out[t, 1] = n_conf_ne
+            out[t, 2] = rank
+            out[t, 3] = mx
+            out[t, 4] = nla
+            out[t, 5] = same
+            out[t, 6] = sib
+            out[t, 7] = sm
+        i = j
+
+
+def stage2_features(tok, s1r, sxr, p1):
+    """S2_COLS for pairs grouped by s1, from stage-1 (out-of-fold) probabilities p1."""
+    s1r64, sxr64 = s1r.astype(np.int64), sxr.astype(np.int64)
+    n = len(s1r64)
+    off = np.empty(n, dtype=np.float32)
+    bval = np.empty(n, dtype=np.int64)
+    flags = np.zeros((n, 4), dtype=np.float32)
+    number_alignment(tok["nums1_ptr"], tok["nums1_val"], tok["numsx_ptr"], tok["numsx_val"], s1r64, sxr64,
+                     DISTRACTOR_SHIFTS, off, bval, flags)
+    h1 = core_hash(tok["ns1_ptr"], tok["ns1_ids"])
+    hx = core_hash(tok["nsx_ptr"], tok["nsx_ids"])
+    empty = tok["flags_sx"][:, 2] > 0
+    out = np.zeros((n, len(S2_COLS)), dtype=np.float32)
+    p = np.clip(p1.astype(np.float64), 1e-6, 1 - 1e-6)
+    out[:, 0] = np.log(p / (1 - p))
+    tmp = np.zeros((n, len(S2_COLS) - 1), dtype=np.float32)
+    _stage2(s1r64, p1.astype(np.float32), empty[sxr64], hx[sxr64], h1[s1r64], bval, tmp)
+    out[:, 1:] = tmp
+    return out
+
+
 def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss):
     """All CTX_COLS for candidate pairs grouped by s1 (s1r sorted/grouped). Returns float32 (n, len(CTX_COLS))."""
     s1r64, sxr64 = s1r.astype(np.int64), sxr.astype(np.int64)

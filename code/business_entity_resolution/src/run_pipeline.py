@@ -347,20 +347,26 @@ def _score(s1r, sxr, mask, s1_rows, s1_ids, sx_ids, truth):
 
 
 def stage_validate(args):
-    import json
-
     import xgboost as xgb
 
     from . import judge
-    from .decide import assign_best, expected_f05_cut, threshold_cut
     booster = xgb.Booster(model_file=work("models", "judge_v1.json"))
+    p = judge.predict(booster, np.load(work("feat", "train_V.npy"), mmap_mode="r"))
+    np.save(work("pred", "train_V_p.npy"), p)
+    _validate_probs(p, "decision.json")
+
+
+def _validate_probs(p, decision_file):
+    """Macro F0.5 on V (and the stress view) for pair probabilities p aligned with train_V_pairs; picks the
+    decision rule and writes it to models/<decision_file>."""
+    import json
+
+    from .decide import assign_best, expected_f05_cut, threshold_cut
     s1 = load_prep("train", "s1", ["entity_id", "country", "part"])
     sx_ids = load_prep("train", "sx", ["entity_id"])["entity_id"].to_numpy()
     s1_ids = s1["entity_id"].to_numpy()
     country = s1["country"].to_numpy()
     pairs = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
-    p = judge.predict(booster, np.load(work("feat", "train_V.npy"), mmap_mode="r"))
-    np.save(work("pred", "train_V_p.npy"), p)
     s1r, sxr = pairs["s1"].to_numpy(), pairs["sx"].to_numpy()
     rng = np.random.default_rng(0)
     v_rows = np.flatnonzero((s1["part"] == "V").to_numpy())
@@ -390,10 +396,90 @@ def stage_validate(args):
     use_ef = (results["V"]["expected_f"] + results["V-stress"]["expected_f"] >=
               results["V"][thr_key] + results["V-stress"][thr_key])
     decision = {"rule": "expected_f" if use_ef else "threshold", "threshold": float(thr_key[3:]),
-                "floor": _saved_floor()}
-    with open(work("models", "decision.json"), "w") as f:
+                "floor": _saved_floor(), "v_score": results["V"]["expected_f" if use_ef else thr_key]}
+    with open(work("models", decision_file), "w") as f:
         json.dump(decision, f)
     log("decision", decision)
+    return decision
+
+
+def _stage2_models_and_probs(XJ, pj, XV, pv, tok):
+    """Stage 2: out-of-fold stage-1 probabilities on J (2 folds by s1), stage-2 features, stage-2 judge.
+    Returns the stage-2 V probabilities; models are saved under models/."""
+    from . import judge
+    from .context import stage2_features
+    s1j, yj = pj["s1"].to_numpy(), pj["label"].to_numpy().astype(np.float32)
+    ev = (s1j % 10 == 0)
+    fold = s1j % 2
+    p1j = np.empty(len(yj), dtype=np.float32)
+    fold_models = []
+    for f in (0, 1):
+        tr = fold == f  # rows keep the (ev last) order, so the eval slice stays at the end
+        m = judge.train(XJ[tr], yj[tr], int((ev & tr).sum()))
+        m.save_model(work("models", f"judge_f{f}.json"))
+        fold_models.append(m)
+        p1j[fold != f] = judge.predict(m, XJ[fold != f])
+        log(f"stage-1 fold {f}: best iteration {m.best_iteration}")
+    p1v = np.mean([judge.predict(m, XV) for m in fold_models], axis=0)
+    S2j = stage2_features(tok, s1j, pj["sx"].to_numpy(), p1j)
+    S2v = stage2_features(tok, pv["s1"].to_numpy(), pv["sx"].to_numpy(), p1v)
+    m2 = judge.train(np.hstack([XJ, S2j]), yj, int(ev.sum()))
+    m2.save_model(work("models", "judge_s2.json"))
+    log("stage-2 best iteration", m2.best_iteration)
+    return judge.predict(m2, np.hstack([XV, S2v])), p1v
+
+
+def stage_stage2(args):
+    """Train the stacked stage-2 judge on J and validate it on V (writes models/decision_s2.json)."""
+    from .features import load_token_arrays
+    tok = load_token_arrays(work("tok", "train.npz"))
+    XJ = np.load(work("feat", "train_J.npy")).astype(np.float32)
+    XV = np.load(work("feat", "train_V.npy")).astype(np.float32)
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
+    p2, p1v = _stage2_models_and_probs(XJ, pj, XV, pv, tok)
+    np.save(work("pred", "train_V_p2.npy"), p2)
+    log("stage-1 (OOF-fold average) on V:")
+    _validate_probs(p1v, "decision_s1avg.json")
+    log("stage-2 on V:")
+    _validate_probs(p2, "decision_s2.json")
+
+
+def stage_predict_stage2(args):
+    """Test predictions with the stage-2 judge from saved test features (written by predict-test)."""
+    import json
+
+    import xgboost as xgb
+
+    from . import judge
+    from .context import stage2_features
+    from .features import load_token_arrays
+    from .io_utils import write_submission
+    with open(work("models", "decision_s2.json")) as f:
+        decision = json.load(f)
+    if args.country_thr:
+        decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
+    tok = load_token_arrays(work("tok", "test.npz"))
+    scored = pl.read_parquet(work("pred", "test_pairs_p.parquet"))
+    s1r, sxr = scored["s1"].to_numpy(), scored["sx"].to_numpy()
+    X = np.load(work("feat", "test.npy"), mmap_mode="r")
+    fold_models = [xgb.Booster(model_file=work("models", f"judge_f{f}.json")) for f in (0, 1)]
+    m2 = xgb.Booster(model_file=work("models", "judge_s2.json"))
+    p1 = np.mean([judge.predict(m, X) for m in fold_models], axis=0)
+    S2 = stage2_features(tok, s1r, sxr, p1)
+    p2 = np.empty(len(p1), dtype=np.float32)
+    for b in range(0, len(p1), FEAT_CHUNK):
+        p2[b:b + FEAT_CHUNK] = judge.predict(m2, np.hstack([np.asarray(X[b:b + FEAT_CHUNK], dtype=np.float32),
+                                                            S2[b:b + FEAT_CHUNK]]))
+    pl.DataFrame({"s1": s1r, "sx": sxr, "p": p2}).write_parquet(work("pred", "test_pairs_p2.parquet"))
+    s1 = load_prep("test", "s1", ["entity_id", "country"])
+    sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
+    mask = _decide(s1r, sxr, p2, decision, s1_country=s1["country"].to_numpy())
+    write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
+    log("stage-2 matched pairs", int(mask.sum()), decision)
+    del sx_ids, X
+    gc.collect()
+    _run_validator()
 
 
 def _decide(s1r, sxr, p, decision, s1_country=None):
@@ -472,12 +558,19 @@ def stage_predict_test(args):
         lo_test.append(np.array([m.get(t, 0.0) for t in vte], dtype=np.float32))
     cand = _add_context(cand, tok, *lo_test)
 
+    from .features import FEATURES
     fz = PairFeaturizer(s1, sx, tok)
     booster = xgb.Booster(model_file=work("models", "judge_v1.json"))
     p = np.empty(cand.height, dtype=np.float32)
+    xout = np.lib.format.open_memmap(work("feat", "test.npy"), mode="w+", dtype=np.float16,
+                                     shape=(cand.height, len(FEATURES)))  # kept for the stage-2 judge
     for b in range(0, cand.height, FEAT_CHUNK):
-        p[b:b + FEAT_CHUNK] = judge.predict(booster, fz.compute(cand.slice(b, FEAT_CHUNK)))
+        Xc = fz.compute(cand.slice(b, FEAT_CHUNK))
+        xout[b:b + FEAT_CHUNK] = Xc
+        p[b:b + FEAT_CHUNK] = judge.predict(booster, Xc)
         log(f"  test scored {min(b + FEAT_CHUNK, cand.height)}/{cand.height}")
+    xout.flush()
+    del xout
     s1r, sxr = cand["s1"].to_numpy().copy(), cand["sx"].to_numpy().copy()
     pl.DataFrame({"s1": s1r, "sx": sxr, "p": p}).write_parquet(work("pred", "test_pairs_p.parquet"))
     s1_ids, sx_ids = s1["entity_id"].to_list(), sx["entity_id"].to_numpy()
@@ -515,7 +608,7 @@ def stage_rethreshold(args):
 
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
           "candidates": stage_candidates, "address-pass": stage_address_pass, "tokens": stage_tokens,
-          "vocab": stage_vocab,
+          "vocab": stage_vocab, "stage2": stage_stage2, "predict-stage2": stage_predict_stage2,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 

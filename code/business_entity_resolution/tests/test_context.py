@@ -86,6 +86,26 @@ def test_global_name_counts_lookup():
     assert counts(hx, hx[empty]).tolist() == [2, 0, 2, 0]  # empty-address SX sharing it
 
 
+def test_stage2_features_counts():
+    from src.context import S2_COLS, stage2_features
+    # one S1 with 3 candidates: two confident non-empty records sharing number 10, one empty-address low-p copy
+    ns1_ptr, ns1_ids = _csr([[0]], np.int32)
+    nsx_ptr, nsx_ids = _csr([[0], [0], [0]], np.int32)
+    tok = {"ns1_ptr": ns1_ptr, "ns1_ids": ns1_ids, "nsx_ptr": nsx_ptr, "nsx_ids": nsx_ids,
+           "nums1_ptr": _csr([[10]])[0], "nums1_val": _csr([[10]])[1],
+           "numsx_ptr": _csr([[10], [10], []])[0], "numsx_val": _csr([[10], [10], []])[1],
+           "flags_sx": np.array([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 0]], np.float32)}
+    f = stage2_features(tok, np.array([0, 0, 0]), np.array([0, 1, 2]), np.array([0.9, 0.8, 0.3]))
+    col = {c: i for i, c in enumerate(S2_COLS)}
+    assert f[:, col["s2_n_conf"]].tolist() == [1, 1, 2]
+    assert f[:, col["s2_n_conf_nonempty"]].tolist() == [1, 1, 2]
+    assert f[:, col["s2_rank_p"]].tolist() == [0, 1, 2]
+    assert f[:, col["s2_sib_conf"]].tolist() == [1, 1, 0]
+    assert f[:, col["s2_same_core_conf"]].tolist() == [1, 1, 2]
+    assert f[2, col["s2_max_other_p"]] == pytest.approx(0.9)
+    assert f[0, col["p1_logit"]] == pytest.approx(np.log(9), abs=1e-4)
+
+
 def test_core_hash_order_free_and_empty():
     ptr, ids = _csr([[1, 2], [1, 2], [2, 3], []], np.int32)
     h = core_hash(ptr, ids)
