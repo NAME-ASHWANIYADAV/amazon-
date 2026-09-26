@@ -96,6 +96,20 @@ def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, sx_addr_
     return rank_by_cos(cand)
 
 
+def add_address_pass(cand, s1_country, sx_country, s1_emb, sx_emb, k_addr, sx_addr_empty=None, log=print):
+    """Union an existing record-kNN candidate frame with a top-k_addr address-cosine pass for the same S1s
+    (avoids recomputing the record pass). Returns unique pairs re-ranked by record cosine."""
+    q_rows = np.unique(cand["s1"].to_numpy()).astype(np.int64)
+    frames = [cand.select("s1", "sx", "cos", "cos_name", "cos_addr")]
+    for c in sorted(set(s1_country[q_rows].tolist())):
+        qr = q_rows[s1_country[q_rows] == c]
+        dr = np.flatnonzero(sx_country == c)
+        log(f"address knn {c}: {len(qr)} queries x {len(dr)} records, top-{k_addr}")
+        scale = None if sx_addr_empty is None else np.where(sx_addr_empty[dr], np.sqrt(2.0), 1.0)
+        frames.append(_pairs_frame(qr, dr, *knn(s1_emb[qr], sx_emb[dr], k_addr, d_scale=scale, by="addr")))
+    return rank_by_cos(pl.concat(frames).unique(["s1", "sx"], keep="first"))
+
+
 def recall_report(cand, gt_rows, s1_rows, log=print):
     """Share of true (s1, sx) pairs of `s1_rows` found in `cand`, by K and by cosine floor."""
     truth = gt_rows.filter(pl.col("s1_row").is_in(pl.Series(np.asarray(s1_rows, dtype=np.int32)).implode()))

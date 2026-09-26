@@ -33,3 +33,8 @@ def test_address_pass_finds_same_address_with_unrelated_name():
     assert 30 in with_addr["sx"].to_list()
     assert with_addr["rank"].to_list() == list(range(with_addr.height))
     assert with_addr.select(["s1", "sx"]).is_unique().all()
+
+    from src.candidates import add_address_pass
+    merged = add_address_pass(only_record, country, sx_country, s1_emb, sx_emb, k_addr=1)
+    assert sorted(merged["sx"].to_list()) == sorted(with_addr["sx"].to_list())
+    assert merged["rank"].to_list() == list(range(merged.height))

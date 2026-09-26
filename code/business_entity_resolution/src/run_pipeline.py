@@ -118,6 +118,29 @@ def stage_candidates(args):
             recall_report(cand, gt, np.flatnonzero((s1["part"] == p).to_numpy()), log=log)
 
 
+def stage_address_pass(args):
+    """Add top-k_addr address-cosine neighbours to an existing candidates file (in place, backup kept)."""
+    import shutil
+
+    from .candidates import add_address_pass, recall_report
+    s1 = load_prep(args.split, "s1", ["country"] + (["part"] if args.split == "train" else []))
+    sx = load_prep(args.split, "sx", ["country", "addr_empty"])
+    path = work("cand", f"{args.split}.parquet")
+    backup = work("cand", f"{args.split}_record_only.parquet")
+    if not os.path.exists(backup):
+        shutil.copyfile(path, backup)
+    cand = add_address_pass(pl.read_parquet(backup), s1["country"].to_numpy(), sx["country"].to_numpy(),
+                            np.load(work("emb", f"{args.split}_s1.npy"), mmap_mode="r"),
+                            np.load(work("emb", f"{args.split}_sx.npy"), mmap_mode="r"),
+                            args.k_addr, sx_addr_empty=sx["addr_empty"].to_numpy(), log=log)
+    cand.write_parquet(path)
+    log("candidates with address pass", cand.shape)
+    if args.split == "train":
+        gt = pl.read_parquet(work("prep", "train_gt_rows.parquet"))
+        log("recall on V:")
+        recall_report(cand, gt, np.flatnonzero((s1["part"] == "V").to_numpy()), log=log)
+
+
 FEAT_CHUNK = 2_000_000
 
 
@@ -345,7 +368,8 @@ def stage_rethreshold(args):
 
 
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
-          "candidates": stage_candidates, "tokens": stage_tokens, "features": stage_features, "train-judge": stage_train_judge,
+          "candidates": stage_candidates, "address-pass": stage_address_pass, "tokens": stage_tokens,
+          "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
 
