@@ -16,8 +16,13 @@ def _half_cos(q, d):
 
 
 @torch.no_grad()
-def knn(q_emb, d_emb, k, q_chunk=1024, d_block=300_000):
+def knn(q_emb, d_emb, k, d_scale=None, q_chunk=1024, d_block=250_000):
+    """Top-k SX per query by record cosine. `d_scale` (per SX row) rescales records before the dot
+    product: an empty-address SX has vector [name, 0], whose cosine with a full S1 record is capped at
+    1/sqrt(2); scaling it by sqrt(2) puts it on the same 0..1 scale as full records (cos = cos_name)."""
     D = torch.from_numpy(np.ascontiguousarray(d_emb)).to(DEVICE)  # float16 on GPU
+    if d_scale is not None:
+        D *= torch.from_numpy(np.asarray(d_scale, dtype=np.float16)).to(DEVICE).unsqueeze(1)
     k = min(k, len(D))
     nq = len(q_emb)
     out = {n: np.empty((nq, k), dtype=np.float32) for n in ("cos", "cos_name", "cos_addr")}
@@ -27,11 +32,15 @@ def knn(q_emb, d_emb, k, q_chunk=1024, d_block=300_000):
         best_v = torch.full((len(Q), k), -2.0, device=DEVICE)
         best_i = torch.zeros((len(Q), k), dtype=torch.int64, device=DEVICE)
         for b in range(0, len(D), d_block):
-            sims = Q @ D[b:b + d_block].float().T
+            blk = D[b:b + d_block].float()
+            sims = Q @ blk.T
+            del blk
             v, i = sims.topk(min(k, sims.shape[1]), dim=1)
+            del sims  # free before the next block's matmul: keeps one sims buffer alive, not two
             v, i = torch.cat([best_v, v], 1), torch.cat([best_i, i + b], 1)
             best_v, pos = v.topk(k, dim=1)
             best_i = i.gather(1, pos)
+            del v, i, pos
         Dk = D[best_i].float()
         out["cos"][s:s + len(Q)] = best_v.cpu().numpy()
         out["cos_name"][s:s + len(Q)] = _half_cos(Q[:, :EMB_DIM], Dk[..., :EMB_DIM]).cpu().numpy()
@@ -42,14 +51,15 @@ def knn(q_emb, d_emb, k, q_chunk=1024, d_block=300_000):
     return out_idx, out["cos"], out["cos_name"], out["cos_addr"]
 
 
-def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, log=print):
+def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, sx_addr_empty=None, log=print):
     """kNN per country for the S1 rows in q_rows. Returns a polars frame sorted by (s1, rank)."""
     frames = []
     for c in sorted(set(s1_country[q_rows].tolist())):
         qr = q_rows[s1_country[q_rows] == c]
         dr = np.flatnonzero(sx_country == c)
         log(f"knn {c}: {len(qr)} queries x {len(dr)} records")
-        idx, cos, cn, ca = knn(s1_emb[qr], sx_emb[dr], k)
+        scale = None if sx_addr_empty is None else np.where(sx_addr_empty[dr], np.sqrt(2.0), 1.0)
+        idx, cos, cn, ca = knn(s1_emb[qr], sx_emb[dr], k, d_scale=scale)
         kk = idx.shape[1]
         frames.append(pl.DataFrame({
             "s1": np.repeat(qr, kk).astype(np.int32), "sx": dr[idx.ravel()].astype(np.int32),

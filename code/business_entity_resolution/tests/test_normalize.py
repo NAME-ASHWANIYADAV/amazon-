@@ -50,6 +50,10 @@ def test_name_indic_flag():
     assert norm_name("हरि एक्सपोर्ट्स")[4] is True
 
 
+def test_name_uppercase_ligature_folded():
+    assert norm_name("CŒUR DE FRANCE")[0] == norm_name("Cœur de France")[0] == "coeur de france"
+
+
 def test_addr_us_street_cdp_state_code():
     assert norm_addr("598 UTICA ST, BUFFALO CDP, NY", "US") == ("598 utica street buffalo ny", "598", False)
 

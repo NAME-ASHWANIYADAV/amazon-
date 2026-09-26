@@ -1,5 +1,6 @@
 """CLI for every pipeline stage: python -m src.run_pipeline <stage> [options]."""
 import argparse
+import gc
 import os
 import time
 import zlib
@@ -99,7 +100,7 @@ def stage_encode(args):
 def stage_candidates(args):
     from .candidates import build_candidates, recall_report
     s1 = load_prep(args.split, "s1", ["country"] + (["part"] if args.split == "train" else []))
-    sx = load_prep(args.split, "sx", ["country"])
+    sx = load_prep(args.split, "sx", ["country", "addr_empty"])
     s1_emb = np.load(work("emb", f"{args.split}_s1.npy"), mmap_mode="r")
     sx_emb = np.load(work("emb", f"{args.split}_sx.npy"), mmap_mode="r")
     if args.split == "train":
@@ -107,7 +108,7 @@ def stage_candidates(args):
     else:
         q_rows = np.arange(s1.height)
     cand = build_candidates(s1["country"].to_numpy(), sx["country"].to_numpy(), q_rows, s1_emb, sx_emb,
-                            config.TOP_K, log=log)
+                            config.TOP_K, sx_addr_empty=sx["addr_empty"].to_numpy(), log=log)
     cand.write_parquet(work("cand", f"{args.split}.parquet"))
     log("candidates", cand.shape)
     if args.split == "train":
@@ -261,12 +262,17 @@ def _decide(s1r, sxr, p, decision):
 
 
 def _run_validator():
+    """Validate the scored file only. The candidate file is skipped on purpose: the validator keeps every
+    candidate id in Python sets (~7 GB at 69M ids), and matches are candidate rows by construction.
+    cwd=OUT_DIR so the validator's default 'output/candidate_pairs.tsv' is not found and gets skipped."""
     import subprocess
     import sys
     validator = os.path.join(config.ROOT, "student_resource", "utils", "validate_submission.py")
+    if not os.path.isfile(validator):
+        log("validator not found at", validator, "- skipping format check")
+        return
     subprocess.run([sys.executable, validator, "--matching", os.path.join(config.OUT_DIR, "matching_results.tsv"),
-                    "--candidate", os.path.join(config.OUT_DIR, "candidate_pairs.tsv"),
-                    "--test-dir", os.path.join(config.DATA_DIR, "test")], check=True)
+                    "--test-dir", os.path.join(config.DATA_DIR, "test")], cwd=config.OUT_DIR, check=True)
 
 
 def stage_predict_test(args):
@@ -288,10 +294,15 @@ def stage_predict_test(args):
         p[b:b + FEAT_CHUNK] = judge.predict(booster, fz.compute(cand.slice(b, FEAT_CHUNK)))
         log(f"  test scored {min(b + FEAT_CHUNK, cand.height)}/{cand.height}")
     np.save(work("pred", "test_p.npy"), p)
-    s1r, sxr = cand["s1"].to_numpy(), cand["sx"].to_numpy()
+    s1r, sxr = cand["s1"].to_numpy().copy(), cand["sx"].to_numpy().copy()
+    s1_ids, sx_ids = s1["entity_id"].to_list(), sx["entity_id"].to_numpy()
+    del cand, fz, s1, sx
+    gc.collect()
     mask = _decide(s1r, sxr, p, decision)
-    write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx["entity_id"].to_numpy(), s1r, sxr, mask)
-    log("matched pairs", int(mask.sum()), "S1 with >=1 match", len(np.unique(s1r[mask])), "of", s1.height)
+    write_submission(config.OUT_DIR, s1_ids, sx_ids, s1r, sxr, mask)
+    log("matched pairs", int(mask.sum()), "S1 with >=1 match", len(np.unique(s1r[mask])), "of", len(s1_ids))
+    del sx_ids, s1r, sxr, p, mask
+    gc.collect()
     _run_validator()
 
 
@@ -307,9 +318,12 @@ def stage_rethreshold(args):
     cand = _pruned_candidates("test", decision["floor"])
     p = np.load(work("pred", "test_p.npy"))
     s1r, sxr = cand["s1"].to_numpy(), cand["sx"].to_numpy()
+    del cand
     mask = _decide(s1r, sxr, p, decision)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
+    del sx_ids, s1r, sxr, p, mask
+    gc.collect()
     _run_validator()
 
 

@@ -13,7 +13,10 @@ FEATURES = [
     "name_idf_inter", "tset", "tsort", "partial", "ratio", "nospace", "jw", "alt_best", "legal_code",
     "addr_inter", "addr_len1", "addr_lenx", "addr_jacc", "addr_idf_jacc", "addr_tset", "addr_ratio",
     "num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
-    "num_x_unmatched", "num_x_primary_in_1", "was_indic", "is_domain", "addr_empty_x", "is_s3"]
+    "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel",
+    "was_indic", "is_domain", "addr_empty_x", "is_s3"]
+NUM_COLS = ["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
+            "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel"]
 
 
 def _token_csr(strings, vocab, skip_digits=False):
@@ -88,8 +91,8 @@ def _set_feats(a_ptr, a_ids, b_ptr, b_ids, idf, pa, pb, out):
 
 @numba.njit(parallel=True, cache=True)
 def _num_feats(a_ptr, a_val, b_ptr, b_val, pa, pb, out):
-    """out: primary_eq, any_eq, log1p(min|diff|), min rel diff, n_a, n_b, b_unmatched, b_primary_in_a.
-    -1 marks 'not applicable' (a side without numbers)."""
+    """out: primary_eq, any_eq, log1p(min|diff|), min rel diff, n_a, n_b, b_unmatched, b_primary_in_a,
+    log1p(|primary_a - primary_b|), relative primary diff. -1 marks 'not applicable' (no numbers)."""
     for q in numba.prange(len(pa)):
         i, j = pa[q], pb[q]
         x0, x1, y0, y1 = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
@@ -101,8 +104,13 @@ def _num_feats(a_ptr, a_val, b_ptr, b_val, pa, pb, out):
             out[q, 2] = -1.0
             out[q, 3] = -1.0
             out[q, 7] = -1.0
+            out[q, 8] = -1.0
+            out[q, 9] = -1.0
             out[q, 6] = y1 - y0
             continue
+        pd = float(abs(a_val[x0] - b_val[y0]))
+        out[q, 8] = np.log1p(pd)
+        out[q, 9] = pd / max(a_val[x0], b_val[y0], 1)
         prim = a_val[x0]
         peq, anyeq, unmatched = 0, 0, 0
         best, brel = 1e18, 1e18
@@ -199,10 +207,9 @@ class PairFeaturizer:
         X[:, col["addr_jacc"]] = o[:, 0] / np.maximum(o[:, 1] + o[:, 2] - o[:, 0], 1)
         X[:, col["addr_idf_jacc"]] = o[:, 3] / np.maximum(o[:, 4], 1e-6)
 
-        on = np.zeros((n, 8), dtype=np.float32)
+        on = np.zeros((n, len(NUM_COLS)), dtype=np.float32)
         _num_feats(self.num1[0], self.num1[1], self.numx[0], self.numx[1], s1r, sxr, on)
-        for c, f in enumerate(["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1",
-                               "num_nx", "num_x_unmatched", "num_x_primary_in_1"]):
+        for c, f in enumerate(NUM_COLS):
             X[:, col[f]] = on[:, c]
 
         c1 = self.s1["name_core"].gather(s1r).to_list()

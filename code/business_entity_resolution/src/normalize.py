@@ -127,7 +127,8 @@ def _fold(s):
 
 
 def _basic(s):
-    s = _fold(transliterate(unicodedata.normalize("NFC", s))).lower()
+    # lowercase before folding: _LATIN_EXTRA keys are lowercase (Œ -> œ -> oe)
+    s = _fold(transliterate(unicodedata.normalize("NFC", s)).lower())
     return _DOTTED.sub(lambda m: m.group(0).replace(".", ""), s)
 
 

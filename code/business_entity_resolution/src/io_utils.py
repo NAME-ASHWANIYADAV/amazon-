@@ -33,13 +33,14 @@ def write_submission(out_dir, s1_ids, sx_ids, s1r, sxr, mask):
     s1r/sxr: candidate pairs as row indices; mask: True where the pair is a predicted match."""
     os.makedirs(out_dir, exist_ok=True)
     order = np.argsort(s1r, kind="stable")
-    s1r, names, mask = s1r[order], sx_ids[sxr[order]], mask[order]
-    bounds = np.searchsorted(s1r, np.arange(len(s1_ids) + 1))
+    s1s, sxs, ms = s1r[order], sxr[order], mask[order]
+    bounds = np.searchsorted(s1s, np.arange(len(s1_ids) + 1))
     with open(os.path.join(out_dir, "candidate_pairs.tsv"), "w", encoding="utf-8", newline="\n") as fc, \
             open(os.path.join(out_dir, "matching_results.tsv"), "w", encoding="utf-8", newline="\n") as fm:
         fc.write("source1_entity_id\tcandidate_entity_ids\n")
         fm.write("source1_entity_id\tmatched_entity_ids\n")
         for i, s1 in enumerate(s1_ids):
             lo, hi = bounds[i], bounds[i + 1]
-            fc.write(f"{s1}\t{','.join(names[lo:hi])}\n")
-            fm.write(f"{s1}\t{','.join(names[lo:hi][mask[lo:hi]])}\n")
+            names = sx_ids[sxs[lo:hi]]  # per-S1 slice: never materialise all ~69M names at once
+            fc.write(f"{s1}\t{','.join(names)}\n")
+            fm.write(f"{s1}\t{','.join(names[ms[lo:hi]])}\n")
