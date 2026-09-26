@@ -8,7 +8,7 @@ def _cols(off, ins, sib1, sibx, s3, xw=None):
     return {"hn_off": np.array(off, np.float32), "hn_in_set": np.array(ins, np.float32),
             "hn_sib_1": np.array(sib1, np.float32), "hn_sib_x": np.array(sibx, np.float32),
             "cos_name": np.full(n, 0.9, np.float32), "xw_n_extra": np.array(xw or [0] * n, np.float32),
-            "is_s3": np.array(s3, np.float32)}
+            "mw_n_miss": np.zeros(n, np.float32), "is_s3": np.array(s3, np.float32)}
 
 
 def test_r1_same_source_conflict_takes_the_whole_group():
@@ -16,7 +16,7 @@ def test_r1_same_source_conflict_takes_the_whole_group():
     s1r = np.zeros(6, np.int64)
     p = np.array([.99, .98, .9, .85, .8, .9], np.float32)
     keep = np.ones(6, bool)
-    cols = _cols(off=[0, 0, 1, 1, 7, 0], ins=[0, 0, 1, 1, 1, 0], sib1=[1, 1, 2, 2, 2, 2], sibx=[0, 0, 1, 1, 0, 0],
+    cols = _cols(off=[0, 0, 1, 1, 7, 3], ins=[0, 0, 1, 1, 1, 1], sib1=[1, 1, 2, 2, 2, 0], sibx=[0, 0, 1, 1, 0, 0],
                  s3=[0, 1, 0, 1, 0, 0])
     xword = np.array([0, 0, 0, 0, 0, 1], bool)
     rej, m = lookalike_reject(s1r, p, keep, cols, np.zeros(6, bool), xword)
@@ -42,3 +42,18 @@ def test_ra_needs_every_group_member_modified():
 def test_extra_legal():
     got = extra_legal(["", "llc"], ["inc", "llc", ""], np.array([0, 1, 1]), np.array([0, 1, 0]))
     assert got.tolist() == [True, False, True]
+
+
+def test_word_rule_only_at_a_shifted_number_and_rf_only_for_unseen_countries():
+    s1r = np.zeros(4, np.int64)
+    p = np.array([.99, .9, .9, .9], np.float32)
+    keep = np.ones(4, bool)
+    cols = _cols(off=[0, 0, 1, 2], ins=[0, 0, 1, 1], sib1=[1, 1, 1, 1], sibx=[0, 0, 0, 0], s3=[0, 1, 1, 1],
+                 xw=[0, 1, 1, 0])
+    xword = np.array([False, True, False, False])            # 'france' added at the exact address: kept
+    xleg = np.array([False, False, False, True])
+    for unseen, want in ((False, [False] * 4), (True, [False, False, True, True])):
+        _, m = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=np.zeros(4, bool),
+                                unseen=np.full(4, unseen))
+        assert not m["W"].any()
+        assert m["RF"].tolist() == want

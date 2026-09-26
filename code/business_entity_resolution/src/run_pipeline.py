@@ -596,12 +596,17 @@ def cap_per_source(s1r, is_s3, p, mask, caps=SOURCE_CAPS):
 def _lookalike_post(split, s1r, sxr, X):
     """Returns f(p, keep) -> reject mask of the lookalike rules (src/lookalike.py) for these pairs."""
     from .features import FEATURES
-    from .lookalike import NEED_COLS, extra_legal, extra_words, lookalike_reject
+    from .lookalike import NEED_COLS, extra_legal, extra_words, legal_dropped, lookalike_reject
     names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
     M = np.asarray(X[:, [names.index(c) for c in NEED_COLS]], dtype=np.float32)
     cols = {c: M[:, i] for i, c in enumerate(NEED_COLS)}
     s1 = load_prep(split, "s1", ["legal", "country"])
-    xleg = extra_legal(s1["legal"].to_list(), load_prep(split, "sx", ["legal"])["legal"].to_list(), s1r, sxr)
+    sx_legal = load_prep(split, "sx", ["legal"])["legal"].to_list()
+    xleg = extra_legal(s1["legal"].to_list(), sx_legal, s1r, sxr)
+    ldrop = legal_dropped(s1["legal"].to_list(), sx_legal, s1r, sxr)
+    del sx_legal
+    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    unseen = ~np.isin(s1["country"].to_numpy()[s1r], sorted(seen))
     with np.load(work("tok", f"{split}.npz")) as z:
         tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
     vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
@@ -609,7 +614,7 @@ def _lookalike_post(split, s1r, sxr, X):
     del tok, vocab
 
     def post(p, keep):
-        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword)
+        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen)
         log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
         return rej
     return post

@@ -9,7 +9,10 @@ Every rule uses a generator regularity measured on train truth:
 - shifted groups whose every member only adds a legal form or descriptor are fakes (RA with a confirming copy
   at the S1 number, RB without one);
 - descriptor words that are never a true copy in train (holdings, group, the country name) and their French
-  analogues (W).
+  analogues, at a shifted house number (W; at the exact address 'france' is true-copy noise like 'fils');
+- in a country the model never saw in training, a +1/+2 copy whose name words or legal form changed while
+  copies confirm the S1 number (RF). True number typos are sign-symmetric (+1/+2 as often as -1/-2 in V);
+  test France has 11x more +1/+2 than -1/-2 predictions in exactly this cell.
 Rejected pairs are removed after the SX -> best-S1 assignment (so the SX does not flow to another S1)."""
 import numpy as np
 import polars as pl
@@ -17,8 +20,8 @@ import polars as pl
 DISTRACTOR_SET = [1, 2, 3, 4, 5, 7, 9, 11, 13, 21]
 FAKE_WORDS = ("holding", "holdings", "group", "groupe", "participations")
 COUNTRY_WORD = {"France": "france", "India": "india"}
-NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "is_s3"]
-RULES = ("R1", "RA", "RM", "RB", "W")
+NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3"]
+RULES = ("R1", "RA", "RM", "RB", "W", "RF")
 
 
 def _token_flags(ptr, ids, token_ids):
@@ -57,16 +60,29 @@ def extra_words(tok, vocab, s1r, sxr, pair_country):
     return out
 
 
-def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5):
-    """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words.
+def legal_dropped(s1_legal, sx_legal, s1r, sxr):
+    """Pair flag: the S1 has a legal form and the SX has none (a symmetric, true-copy edit)."""
+    e1 = np.array([not s for s in s1_legal], dtype=bool)
+    ex = np.array([not s for s in sx_legal], dtype=bool)
+    return ~e1[s1r] & ex[sxr]
+
+
+def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None):
+    """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words;
+    ldrop: pair flag from legal_dropped; unseen: pair flag 'S1 country not in the training data' (RF only).
     Returns (reject mask, {rule: mask}) over pairs; only kept (assigned) pairs are ever rejected."""
+    n = len(p)
     off = np.asarray(cols["hn_off"], dtype=np.float32)
+    ndiff = (np.asarray(cols["xw_n_extra"], dtype=np.float32) + np.asarray(cols["mw_n_miss"], dtype=np.float32)) > 0
     df = pl.DataFrame({
         "s1": np.asarray(s1r, dtype=np.int64), "p": np.asarray(p, dtype=np.float32), "keep": keep,
         "off": np.where(off >= 998, np.nan, off), "ins": np.asarray(cols["hn_in_set"]) > 0.5,
         "sib1": np.asarray(cols["hn_sib_1"], dtype=np.float32), "sibx": np.asarray(cols["hn_sib_x"], dtype=np.float32),
         "sim": np.asarray(cols["cos_name"], dtype=np.float32) >= 0.75, "s3": np.asarray(cols["is_s3"]) > 0.5,
         "mod": (np.asarray(cols["xw_n_extra"], dtype=np.float32) > 0) | xleg, "xword": xword,
+        "xleg": xleg, "ndiff": ndiff,
+        "ldrop": np.zeros(n, dtype=bool) if ldrop is None else ldrop,
+        "unseen": np.zeros(n, dtype=bool) if unseen is None else unseen,
     }).with_columns(pl.col("off").fill_nan(None))
     num = pl.col("off").is_not_null() & (pl.col("off") != 0)
     anc = (pl.col("keep") & (pl.col("p") >= tau) & (pl.col("off") == 0)).fill_null(False).cast(pl.Int32)
@@ -83,7 +99,8 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5):
         "RM": pl.col("ins") & pl.col("sim") & (pl.col("g2") >= 1) & (pl.col("g3") >= 1),
         "RB": pl.col("ins") & (pl.col("off") >= 3) & pl.col("mod") & (pl.col("sib1") == 0) & (pl.col("sibx") >= 1)
               & (pl.col("g_unmod") == 0),
-        "W": pl.col("xword"),
+        "W": pl.col("xword") & num,
+        "RF": pl.col("unseen") & off12 & (pl.col("sib1") >= 1) & (pl.col("xleg") | pl.col("ndiff")) & ~pl.col("ldrop"),
     }
     df = df.with_columns([(e & pl.col("keep")).fill_null(False).alias(k) for k, e in exprs.items()])
     # R1 condemns the whole (S1, number) group of the lookalike, including its copies from the other source
