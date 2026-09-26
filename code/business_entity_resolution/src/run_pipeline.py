@@ -605,8 +605,20 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
     xleg = extra_legal(s1["legal"].to_list(), sx_legal, s1r, sxr)
     ldrop = legal_dropped(s1["legal"].to_list(), sx_legal, s1r, sxr)
     del sx_legal
-    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    tr1 = load_prep("train", "s1", ["country", "legal"])
+    seen = set(tr1["country"].unique().to_list())
     unseen = ~np.isin(s1["country"].to_numpy()[s1r], sorted(seen))
+    # countries whose train true copies (almost) never swap legal forms get rule RL
+    from .lookalike import LEGAL_SWAP_STRICT, legal_swapped
+    gt = pl.read_parquet(work("prep", "train_gt_rows.parquet"))
+    g1, gx = gt["s1_row"].to_numpy(), gt["sx_row"].to_numpy()
+    sw = legal_swapped(tr1["legal"].to_list(), load_prep("train", "sx", ["legal"])["legal"].to_list(), g1, gx)
+    tc = tr1["country"].to_numpy()[g1]
+    strict_c = [c for c in sorted(seen) if sw[tc == c].mean() < LEGAL_SWAP_STRICT]
+    log("legal-swap rate of train true copies:", {c: round(float(sw[tc == c].mean()), 4) for c in sorted(seen)},
+        "-> RL for", strict_c)
+    strict = np.isin(s1["country"].to_numpy()[s1r], strict_c)
+    del tr1, gt, g1, gx, sw, tc
     with np.load(work("tok", f"{split}.npz")) as z:
         tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
     vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
@@ -615,7 +627,7 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
 
     def post(p, keep):
         kw = {"rules": tuple(rules)} if rules else {}
-        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen, **kw)
+        rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen, strict=strict, **kw)
         log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
         return rej
     return post

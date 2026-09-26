@@ -57,3 +57,16 @@ def test_word_rule_only_at_a_shifted_number_and_rf_only_for_unseen_countries():
                                 unseen=np.full(4, unseen))
         assert not m["W"].any()
         assert m["RF"].tolist() == want
+
+
+def test_legal_swapped_and_rl_only_for_strict_countries():
+    from src.lookalike import legal_swapped
+    got = legal_swapped(["llc", "", "inc"], ["ltd", "llc", "inc"], np.array([0, 1, 2]), np.array([0, 1, 2]))
+    assert got.tolist() == [True, False, False]          # swap, addition, same
+    s1r = np.zeros(2, np.int64)
+    p = np.array([.99, .9], np.float32)
+    cols = _cols(off=[0, 1], ins=[0, 1], sib1=[1, 1], sibx=[0, 0], s3=[0, 1])
+    xleg = np.array([False, True])
+    for strict, want in ((False, [False, False]), (True, [False, True])):
+        _, m = lookalike_reject(s1r, p, np.ones(2, bool), cols, xleg, np.zeros(2, bool), strict=np.full(2, strict))
+        assert m["RL"].tolist() == want
