@@ -38,3 +38,26 @@ def test_address_pass_finds_same_address_with_unrelated_name():
     merged = add_address_pass(only_record, country, sx_country, s1_emb, sx_emb, k_addr=1)
     assert sorted(merged["sx"].to_list()) == sorted(with_addr["sx"].to_list())
     assert merged["rank"].to_list() == list(range(merged.height))
+
+
+def test_address_pass_per_country_with_checkpoint_and_sink(tmp_path):
+    from src.candidates import add_address_pass, build_candidates
+    rng = np.random.default_rng(1)
+    dim = 64
+    s1_emb = np.stack([_record(rng.normal(size=dim), rng.normal(size=dim)) for _ in range(4)])
+    sx_emb = np.stack([_record(rng.normal(size=dim), rng.normal(size=dim)) for _ in range(40)])
+    s1_country = np.array(["US", "France", "US", "France"], dtype=object)
+    sx_country = np.array(["US", "France"] * 20, dtype=object)
+    q = np.arange(4)
+    only_record = build_candidates(s1_country, sx_country, q, s1_emb, sx_emb, k=3)
+    expect = build_candidates(s1_country, sx_country, q, s1_emb, sx_emb, k=3, k_addr=2)
+    key = lambda f: sorted(zip(f["s1"].to_list(), f["sx"].to_list(), f["rank"].to_list()))
+    ck = lambda c: str(tmp_path / f"knn_{c}.parquet")
+    got = add_address_pass(only_record, s1_country, sx_country, s1_emb, sx_emb, 2, checkpoint=ck)
+    assert key(got) == key(expect)
+    parts = {}
+    add_address_pass(only_record, s1_country, sx_country, s1_emb, sx_emb, 2, checkpoint=ck,
+                     sink=lambda c, f: parts.__setitem__(c, f))           # second run reuses the checkpoints
+    assert sorted(parts) == ["France", "US"] and (tmp_path / "knn_US.parquet").exists()
+    import polars as pl
+    assert key(pl.concat(list(parts.values()))) == key(expect)

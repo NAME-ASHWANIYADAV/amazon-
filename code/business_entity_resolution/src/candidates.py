@@ -1,4 +1,6 @@
 """GPU brute-force cosine kNN between S1 and SX fingerprint vectors (per country)."""
+import os
+
 import numpy as np
 import polars as pl
 import torch
@@ -96,18 +98,57 @@ def build_candidates(s1_country, sx_country, q_rows, s1_emb, sx_emb, k, sx_addr_
     return rank_by_cos(cand)
 
 
-def add_address_pass(cand, s1_country, sx_country, s1_emb, sx_emb, k_addr, sx_addr_empty=None, log=print):
+PAIR_COLS = ["s1", "sx", "cos", "cos_name", "cos_addr"]
+
+
+def _pair_keys(s1, sx):
+    return (s1.astype(np.int64) << 32) | sx.astype(np.int64)
+
+
+def merge_new_pairs(base, extra):
+    """base ∪ extra on (s1, sx), base rows kept on ties, re-ranked by record cosine. Dedup by int64 pair keys
+    (np.isin sorts) instead of a hash unique over the whole frame, which ran out of memory on test."""
+    new = ~np.isin(_pair_keys(extra["s1"].to_numpy(), extra["sx"].to_numpy()),
+                   _pair_keys(base["s1"].to_numpy(), base["sx"].to_numpy()))
+    return rank_by_cos(pl.concat([base.select(PAIR_COLS), extra.select(PAIR_COLS).filter(pl.Series(new))]))
+
+
+def add_address_pass(cand, s1_country, sx_country, s1_emb, sx_emb, k_addr, sx_addr_empty=None, log=print,
+                     checkpoint=None, sink=None):
     """Union an existing record-kNN candidate frame with a top-k_addr address-cosine pass for the same S1s
-    (avoids recomputing the record pass). Returns unique pairs re-ranked by record cosine."""
-    q_rows = np.unique(cand["s1"].to_numpy()).astype(np.int64)
-    frames = [cand.select("s1", "sx", "cos", "cos_name", "cos_addr")]
-    for c in sorted(set(s1_country[q_rows].tolist())):
-        qr = q_rows[s1_country[q_rows] == c]
-        dr = np.flatnonzero(sx_country == c)
-        log(f"address knn {c}: {len(qr)} queries x {len(dr)} records, top-{k_addr}")
-        scale = None if sx_addr_empty is None else np.where(sx_addr_empty[dr], np.sqrt(2.0), 1.0)
-        frames.append(_pairs_frame(qr, dr, *knn(s1_emb[qr], sx_emb[dr], k_addr, d_scale=scale, by="addr")))
-    return rank_by_cos(pl.concat(frames).unique(["s1", "sx"], keep="first"))
+    (avoids recomputing the record pass), one country at a time (bounded memory).
+
+    checkpoint(c) -> path: the country's kNN result is saved there and reused if present.
+    sink(c, frame): receives each country's merged frame instead of keeping it; without a sink the frames are
+    concatenated and returned. Either way rows are grouped by s1 (each S1 lives in one country) and ranked by
+    record cosine within each S1."""
+    names, code = np.unique(s1_country, return_inverse=True)
+    row_code = code.astype(np.int8)[cand["s1"].to_numpy()]
+    out = []
+    for k in np.unique(row_code):
+        c = str(names[k])
+        base = cand.filter(pl.Series(row_code == k))
+        path = checkpoint(c) if checkpoint else None
+        if path is not None and os.path.exists(path):
+            extra = pl.read_parquet(path)
+            log(f"address knn {c}: reused {path}")
+        else:
+            qr = np.unique(base["s1"].to_numpy()).astype(np.int64)
+            dr = np.flatnonzero(sx_country == c)
+            log(f"address knn {c}: {len(qr)} queries x {len(dr)} records, top-{k_addr}")
+            scale = None if sx_addr_empty is None else np.where(sx_addr_empty[dr], np.sqrt(2.0), 1.0)
+            extra = _pairs_frame(qr, dr, *knn(s1_emb[qr], sx_emb[dr], k_addr, d_scale=scale, by="addr"))
+            if path is not None:
+                extra.write_parquet(path)
+        merged = merge_new_pairs(base, extra)
+        del base, extra
+        log(f"address pass {c}: {merged.height} pairs")
+        if sink is not None:
+            sink(c, merged)
+        else:
+            out.append(merged)
+        del merged
+    return pl.concat(out) if sink is None else None
 
 
 def recall_report(cand, gt_rows, s1_rows, log=print):

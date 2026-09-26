@@ -160,12 +160,28 @@ def stage_address_pass(args):
     backup = work("cand", f"{args.split}_record_only.parquet")
     if not os.path.exists(backup):
         shutil.copyfile(path, backup)
-    cand = add_address_pass(pl.read_parquet(backup), s1["country"].to_numpy(), sx["country"].to_numpy(),
-                            np.load(work("emb", f"{args.split}_s1.npy"), mmap_mode="r"),
-                            np.load(work("emb", f"{args.split}_sx.npy"), mmap_mode="r"),
-                            args.k_addr, sx_addr_empty=sx["addr_empty"].to_numpy(), log=log)
+    parts = []
+
+    def sink(c, frame):  # one merged file per country, combined at the end (bounded memory)
+        parts.append(work("cand", f"{args.split}_merged_{c}.parquet"))
+        frame.write_parquet(parts[-1])
+
+    knn_file = lambda c: work("cand", f"{args.split}_addrknn{args.k_addr}_{c}.parquet")  # kNN checkpoints
+    add_address_pass(pl.read_parquet(backup, columns=["s1", "sx", "cos", "cos_name", "cos_addr"]),
+                     s1["country"].to_numpy(), sx["country"].to_numpy(),
+                     np.load(work("emb", f"{args.split}_s1.npy"), mmap_mode="r"),
+                     np.load(work("emb", f"{args.split}_sx.npy"), mmap_mode="r"),
+                     args.k_addr, sx_addr_empty=sx["addr_empty"].to_numpy(), log=log, checkpoint=knn_file,
+                     sink=sink)
+    gc.collect()
+    cand = pl.concat([pl.read_parquet(f) for f in parts], rechunk=False)
     cand.write_parquet(path)
     log("candidates with address pass", cand.shape)
+    for f in parts:
+        os.remove(f)
+    for c in np.unique(s1["country"].to_numpy()):
+        if os.path.exists(knn_file(c)):
+            os.remove(knn_file(c))
     if args.split == "train":
         gt = pl.read_parquet(work("prep", "train_gt_rows.parquet"))
         log("recall on V:")
