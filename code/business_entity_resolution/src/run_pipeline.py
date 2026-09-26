@@ -107,8 +107,9 @@ def stage_candidates(args):
     if args.split == "train":
         is_e = (s1["part"] == "E").to_numpy()
         q_rows = np.flatnonzero(is_e if args.queries == "E" else ~is_e)
-        if args.queries == "E":  # lists of the encoder-split S1s: only needed as competitors (see competition_features)
-            name = "train_E"
+        if args.queries == "E":
+            _competitor_lists_e(s1, sx, s1_emb, sx_emb, q_rows)
+            return
     else:
         q_rows = np.arange(s1.height)
     cand = build_candidates(s1["country"].to_numpy(), sx["country"].to_numpy(), q_rows, s1_emb, sx_emb,
@@ -122,6 +123,30 @@ def stage_candidates(args):
         for p in ("J", "V"):
             log(f"recall on {p}:")
             recall_report(cand, gt, np.flatnonzero((s1["part"] == p).to_numpy()), log=log)
+
+
+def _competitor_lists_e(s1, sx, s1_emb, sx_emb, q_rows):
+    """Top-COMPETITOR_RANK record neighbours of the E-split S1s (competitors only). Each country is written
+    to disk as soon as it is done, and no global sort/unique is needed, so memory stays small."""
+    from .candidates import _pairs_frame, knn
+    from .features import COMPETITOR_RANK
+    s1c, sxc, empty = s1["country"].to_numpy(), sx["country"].to_numpy(), sx["addr_empty"].to_numpy()
+    paths = []
+    for c in sorted(set(s1c[q_rows].tolist())):
+        qr = q_rows[s1c[q_rows] == c]
+        dr = np.flatnonzero(sxc == c)
+        log(f"knn E {c}: {len(qr)} queries x {len(dr)} records, top-{COMPETITOR_RANK}")
+        res = knn(s1_emb[qr], sx_emb[dr], COMPETITOR_RANK, d_scale=np.where(empty[dr], np.sqrt(2.0), 1.0))
+        path = work("cand", f"train_E_{c}.parquet")
+        _pairs_frame(qr, dr, *res).select("s1", "sx", "cos", "cos_name").write_parquet(path)
+        paths.append(path)
+        del res
+        gc.collect()
+    e = pl.concat([pl.read_parquet(p) for p in paths])
+    e.write_parquet(work("cand", "train_E.parquet"))
+    for p in paths:
+        os.remove(p)
+    log("candidates train_E", e.shape)
 
 
 def stage_address_pass(args):
@@ -181,22 +206,28 @@ def _pruned_candidates(split, floor, with_comp=True):
     """Candidates with cos >= floor, plus per-S1 list features computed on the pruned lists and cross-S1
     competition features. For train the competitor lists of the E-split S1s (cand/train_E.parquet) are
     included so that every SX sees all its competing S1s, as it does on test."""
-    from .features import COMP_COLS, add_list_features, competition_features
+    from .features import add_list_features
     cand = pl.read_parquet(work("cand", f"{split}.parquet"))
     if floor is not None:
         cand = cand.filter(pl.col("cos") >= floor)
     cand = add_list_features(cand)
     if not with_comp:
         return cand
-    parts = [cand.select("s1", "sx", "cos", "cos_name")]
-    if split == "train":
-        e = pl.read_parquet(work("cand", "train_E.parquet"), columns=["s1", "sx", "cos", "cos_name"])
-        parts.append(e if floor is None else e.filter(pl.col("cos") >= floor))
-    allc = pl.concat(parts)
-    del parts
-    comp = competition_features(allc["sx"].to_numpy(), allc["cos"].to_numpy(), allc["cos_name"].to_numpy(),
-                                n_keep=cand.height)
-    del allc
+    extra = [pl.read_parquet(work("cand", "train_E.parquet"), columns=["s1", "sx", "cos", "cos_name"])] \
+        if split == "train" else []
+    return _with_competition(cand, extra)
+
+
+def _with_competition(cand, extra_competitors=()):
+    """Add COMP_COLS: competitors are every S1's top-COMPETITOR_RANK record candidates (rank < 20 in these
+    lists, plus any extra competitor lists such as the E-split top-20), identical for train and test."""
+    from .features import COMP_COLS, COMPETITOR_RANK, competition_vs_table
+    t = pl.concat([cand.filter(pl.col("rank") < COMPETITOR_RANK).select("s1", "sx", "cos", "cos_name")]
+                  + [e.select("s1", "sx", "cos", "cos_name") for e in extra_competitors])
+    comp = competition_vs_table(cand["s1"].to_numpy(), cand["sx"].to_numpy(), cand["cos"].to_numpy(),
+                                cand["cos_name"].to_numpy(), t["s1"].to_numpy(), t["sx"].to_numpy(),
+                                t["cos"].to_numpy(), t["cos_name"].to_numpy())
+    del t
     gc.collect()
     return cand.with_columns([pl.Series(c, comp[:, i]) for i, c in enumerate(COMP_COLS)])
 
@@ -520,7 +551,7 @@ def stage_predict_test(args):
     import xgboost as xgb
 
     from . import judge
-    from .features import COMP_COLS, PairFeaturizer, add_list_features, competition_features, load_token_arrays
+    from .features import PairFeaturizer, add_list_features, load_token_arrays
     from .io_utils import write_submission
     with open(work("models", "decision.json")) as f:
         decision = json.load(f)
@@ -536,13 +567,12 @@ def stage_predict_test(args):
     kept, n_before = [], cand_all.height
     for c in sorted(set(country.tolist())):
         cc = add_list_features(cand_all.filter(pl.Series(country[cand_all["s1"].to_numpy()] == c)))
-        comp = competition_features(cc["sx"].to_numpy(), cc["cos"].to_numpy(), cc["cos_name"].to_numpy())
-        cc = _with_addr_empty(cc.with_columns([pl.Series(k, comp[:, i]) for i, k in enumerate(COMP_COLS)]), tok)
+        cc = _with_addr_empty(_with_competition(cc), tok)
         pa = _stage_a_predict(cc, models_a)
         cc = cc.with_columns(pl.Series("pA", pa)).filter(pl.col("pA") >= t_a)
         log(f"  {c}: kept {cc.height} of {len(pa)} candidate pairs")
         kept.append(cc)
-        del comp, pa
+        del pa
     cand = pl.concat(kept).sort("s1", "rank")
     del cand_all, kept
     gc.collect()

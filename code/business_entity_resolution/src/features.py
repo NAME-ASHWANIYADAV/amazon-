@@ -76,6 +76,59 @@ def _competition(sx, cos, name, orig, n_keep, out):
         i = j
 
 
+COMPETITOR_RANK = 20  # an S1 competes for an SX when the SX is in its top-20 record-cosine candidates
+
+
+@numba.njit(parallel=True, cache=True)
+def _competition_vs(q_s1, q_sx, q_cos, q_name, t_sx, t_s1, t_cos, t_name, t_start, t_end, u_sx, out):
+    """For each query row, compare with competitor rows of the same SX from OTHER S1s.
+    Competitor table is sorted by sx; u_sx are its unique sx values with [t_start, t_end) ranges."""
+    for q in numba.prange(len(q_s1)):
+        lo, hi = 0, len(u_sx)
+        x = q_sx[q]
+        while lo < hi:  # binary search for the SX group
+            mid = (lo + hi) // 2
+            if u_sx[mid] < x:
+                lo = mid + 1
+            else:
+                hi = mid
+        n_other, rank, close = 0, 0, 0
+        best, best_name = -9.0, -9.0
+        if lo < len(u_sx) and u_sx[lo] == x:
+            for k in range(t_start[lo], t_end[lo]):
+                if t_s1[k] == q_s1[q]:
+                    continue
+                n_other += 1
+                if t_cos[k] > best:
+                    best = t_cos[k]
+                if t_name[k] > best_name:
+                    best_name = t_name[k]
+                if t_cos[k] > q_cos[q]:
+                    rank += 1
+                if t_cos[k] >= q_cos[q] - 0.02:
+                    close += 1
+        out[q, 0] = n_other
+        out[q, 1] = rank
+        out[q, 2] = q_cos[q] - best if n_other > 0 else 1.0
+        out[q, 3] = close
+        out[q, 4] = q_name[q] - best_name if n_other > 0 else 1.0
+        out[q, 5] = 1.0 if rank == 0 else 0.0
+
+
+def competition_vs_table(q_s1, q_sx, q_cos, q_name, t_s1, t_sx, t_cos, t_name):
+    """COMP_COLS for query pairs against a competitor table (each S1's top-COMPETITOR_RANK candidates):
+    other S1s claiming the same SX, this pair's rank among them, margins and near-ties."""
+    order = np.argsort(t_sx, kind="stable")
+    t_sx, t_s1 = t_sx[order].astype(np.int64), t_s1[order].astype(np.int64)
+    t_cos, t_name = t_cos[order].astype(np.float32), t_name[order].astype(np.float32)
+    u_sx, t_start, counts = np.unique(t_sx, return_index=True, return_counts=True)
+    out = np.zeros((len(q_s1), len(COMP_COLS)), dtype=np.float32)
+    _competition_vs(q_s1.astype(np.int64), q_sx.astype(np.int64), q_cos.astype(np.float32),
+                    q_name.astype(np.float32), t_sx, t_s1, t_cos, t_name, t_start.astype(np.int64),
+                    (t_start + counts).astype(np.int64), u_sx, out)
+    return out
+
+
 def competition_features(sx, cos, cos_name, n_keep=None):
     """COMP_COLS for rows [0, n_keep) (original order). Must be given ALL candidate rows of the split,
     i.e. every S1's list, so that each SX sees all of its competing S1s; rows >= n_keep only act as
