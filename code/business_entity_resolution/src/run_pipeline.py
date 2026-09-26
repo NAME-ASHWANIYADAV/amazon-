@@ -292,13 +292,20 @@ def stage_validate(args):
     log("decision", decision)
 
 
-def _decide(s1r, sxr, p, decision):
+def _decide(s1r, sxr, p, decision, s1_country=None):
+    """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
+    overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array)."""
     from .decide import assign_best, expected_f05_cut, threshold_cut
     keep = assign_best(sxr, p)
     mask = np.zeros(len(p), dtype=bool)
     idx = np.flatnonzero(keep)
-    sub = (expected_f05_cut(s1r[idx], p[idx]) if decision["rule"] == "expected_f"
-           else threshold_cut(p[idx], decision["threshold"]))
+    if decision["rule"] == "expected_f":
+        sub = expected_f05_cut(s1r[idx], p[idx])
+    else:
+        thr = np.full(len(idx), decision["threshold"], dtype=np.float32)
+        for c, t in (decision.get("country_thr") or {}).items():
+            thr[s1_country[s1r[idx]] == c] = t
+        sub = threshold_cut(p[idx], thr)
     mask[idx[sub]] = True
     return mask
 
@@ -353,13 +360,15 @@ def stage_rethreshold(args):
     with open(work("models", "decision.json")) as f:
         decision = json.load(f)
     decision.update({"rule": args.rule, "threshold": args.thr if args.thr is not None else decision["threshold"]})
-    s1 = load_prep("test", "s1", ["entity_id"])
+    if args.country_thr:
+        decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
+    s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
     cand = _pruned_candidates("test", decision["floor"])
     p = np.load(work("pred", "test_p.npy"))
     s1r, sxr = cand["s1"].to_numpy(), cand["sx"].to_numpy()
     del cand
-    mask = _decide(s1r, sxr, p, decision)
+    mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy())
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -382,6 +391,7 @@ def main():
     ap.add_argument("--k-addr", type=int, default=0, help="extra neighbours by address cosine (candidates)")
     ap.add_argument("--rule", default="threshold", choices=["threshold", "expected_f"])
     ap.add_argument("--thr", type=float, default=None)
+    ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
     args = ap.parse_args()
     STAGES[args.stage](args)
 
