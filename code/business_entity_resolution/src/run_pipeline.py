@@ -602,24 +602,28 @@ def stage_predict_test(args):
         decision = json.load(f)
     with open(work("models", "stage_a.json")) as f:
         t_a = json.load(f)["threshold"]
-    s1, sx = _load_split_frames("test")
+    country = load_prep("test", "s1", ["country"])["country"].to_numpy()
+    names, code = np.unique(country, return_inverse=True)
+    code = code.astype(np.int8)
     tok = load_token_arrays(work("tok", "test.npz"))
-    country = s1["country"].to_numpy()
     models_a = [xgb.Booster(model_file=work("models", f"stage_a_{f}.json")) for f in (0, 1)]
 
-    # list + competition features and the stage-A filter, one country at a time (bounded memory)
-    cand_all = pl.read_parquet(work("cand", "test.parquet"))
-    kept, n_before = [], cand_all.height
-    for c in sorted(set(country.tolist())):
-        cc = add_list_features(cand_all.filter(pl.Series(country[cand_all["s1"].to_numpy()] == c)))
-        cc = _with_addr_empty(_with_competition(cc), tok)
+    # list + competition features and the stage-A filter, one country at a time. Each country's candidates
+    # are read lazily: holding the whole 79M-row file pushed the process past 16 GB private memory.
+    kept, n_before = [], 0
+    for k, c in enumerate(names):
+        rows = pl.Series(np.flatnonzero(code == k).astype(np.int32))
+        cc = pl.scan_parquet(work("cand", "test.parquet")).filter(pl.col("s1").is_in(rows.implode())).collect()
+        n_before += cc.height
+        cc = _with_addr_empty(_with_competition(add_list_features(cc)), tok)
         pa = _stage_a_predict(cc, models_a)
         cc = cc.with_columns(pl.Series("pA", pa)).filter(pl.col("pA") >= t_a)
         log(f"  {c}: kept {cc.height} of {len(pa)} candidate pairs")
         kept.append(cc)
-        del pa
+        del pa, rows
+        gc.collect()
     cand = pl.concat(kept).sort("s1", "rank")
-    del cand_all, kept
+    del kept
     gc.collect()
     log("stage A kept", cand.height, "of", n_before, f"({cand.height / len(country):.1f}/S1)")
 
@@ -633,8 +637,11 @@ def stage_predict_test(args):
         m = dict(zip(vtr, arr.tolist()))
         lo_test.append(np.array([m.get(t, m.get(WORD_EQUIV.get(t, t), 0.0)) for t in vte], dtype=np.float32))
     cand = _add_context(cand, tok, *lo_test)
+    del lo, vtr, vte, lo_test
+    gc.collect()
 
     from .features import FEATURES
+    s1, sx = _load_split_frames("test")   # string columns: only the featurizer needs them
     fz = PairFeaturizer(s1, sx, tok)
     booster = xgb.Booster(model_file=work("models", "judge_v1.json"))
     p = np.empty(cand.height, dtype=np.float32)
