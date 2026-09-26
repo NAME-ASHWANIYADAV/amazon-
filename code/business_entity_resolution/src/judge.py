@@ -21,6 +21,6 @@ def train(X, y, n_eval, rounds=3000):
 def predict(booster, X, chunk=2_000_000):
     out = np.empty(len(X), dtype=np.float32)
     for b in range(0, len(X), chunk):
-        out[b:b + chunk] = booster.inplace_predict(np.asarray(X[b:b + chunk]),
+        out[b:b + chunk] = booster.inplace_predict(np.asarray(X[b:b + chunk], dtype=np.float32),
                                                    iteration_range=(0, booster.best_iteration + 1))
     return out

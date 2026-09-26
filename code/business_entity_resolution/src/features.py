@@ -17,6 +17,52 @@ FEATURES = [
     "was_indic", "is_domain", "addr_empty_x", "is_s3"]
 NUM_COLS = ["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
             "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel"]
+# Cross-S1 competition: how this S1 compares with every other S1 whose candidate list contains the same SX.
+COMP_COLS = ["comp_n_other", "comp_rank", "comp_margin", "comp_n_close", "comp_margin_name", "comp_is_best"]
+FEATURES = FEATURES + COMP_COLS
+
+
+@numba.njit(cache=True)
+def _competition(sx, cos, name, out):
+    """Rows sorted by (sx, cos desc). out: n_other, rank, margin, n_close, margin_name, is_best."""
+    n = len(sx)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and sx[j] == sx[i]:
+            j += 1
+        b1, b1i, b2 = -9.0, -1, -9.0  # top-2 name cosine in the group
+        for t in range(i, j):
+            if name[t] > b1:
+                b2, b1, b1i = b1, name[t], t
+            elif name[t] > b2:
+                b2 = name[t]
+        g = j - i
+        e = i
+        for t in range(i, j):
+            other = (cos[i + 1] if g > 1 else -9.0) if t == i else cos[i]
+            thr = cos[t] - 0.02
+            while e < j and cos[e] >= thr:
+                e += 1
+            other_name = b2 if t == b1i else b1
+            out[t, 0] = g - 1
+            out[t, 1] = t - i
+            out[t, 2] = cos[t] - other if other > -9.0 else 1.0
+            out[t, 3] = e - i - 1
+            out[t, 4] = name[t] - other_name if other_name > -9.0 else 1.0
+            out[t, 5] = 1.0 if t == i else 0.0
+        i = j
+
+
+def competition_features(sx, cos, cos_name):
+    """COMP_COLS for every row (row order preserved). Must be given ALL candidate rows of the split,
+    i.e. every S1's list, so that each SX sees all of its competing S1s."""
+    order = np.lexsort((-cos, sx))
+    out = np.zeros((len(sx), len(COMP_COLS)), dtype=np.float32)
+    _competition(sx[order], cos[order].astype(np.float32), cos_name[order].astype(np.float32), out)
+    res = np.empty_like(out)
+    res[order] = out
+    return res
 
 
 def _token_csr(strings, vocab, skip_digits=False):
@@ -215,7 +261,8 @@ class PairFeaturizer:
         n = len(s1r)
         X = np.zeros((n, len(FEATURES)), dtype=np.float32)
         col = {f: i for i, f in enumerate(FEATURES)}
-        for f in ("cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size"):
+        # list features (add_list_features) and cross-S1 competition features (competition_features)
+        for f in ["cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size"] + COMP_COLS:
             X[:, col[f]] = cand[f].to_numpy()
 
         o = np.zeros((n, 5), dtype=np.float32)

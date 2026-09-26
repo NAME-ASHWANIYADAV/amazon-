@@ -103,15 +103,21 @@ def stage_candidates(args):
     sx = load_prep(args.split, "sx", ["country", "addr_empty"])
     s1_emb = np.load(work("emb", f"{args.split}_s1.npy"), mmap_mode="r")
     sx_emb = np.load(work("emb", f"{args.split}_sx.npy"), mmap_mode="r")
+    name = args.split
     if args.split == "train":
-        q_rows = np.flatnonzero((s1["part"] != "E").to_numpy())
+        is_e = (s1["part"] == "E").to_numpy()
+        q_rows = np.flatnonzero(is_e if args.queries == "E" else ~is_e)
+        if args.queries == "E":  # lists of the encoder-split S1s: only needed as competitors (see competition_features)
+            name = "train_E"
     else:
         q_rows = np.arange(s1.height)
     cand = build_candidates(s1["country"].to_numpy(), sx["country"].to_numpy(), q_rows, s1_emb, sx_emb,
                             config.TOP_K, sx_addr_empty=sx["addr_empty"].to_numpy(), k_addr=args.k_addr, log=log)
-    cand.write_parquet(work("cand", f"{args.split}.parquet"))
-    log("candidates", cand.shape)
-    if args.split == "train":
+    if name == "train_E":
+        cand = cand.select("s1", "sx", "cos", "cos_name")
+    cand.write_parquet(work("cand", f"{name}.parquet"))
+    log("candidates", name, cand.shape)
+    if name == "train":
         gt = pl.read_parquet(work("prep", "train_gt_rows.parquet"))
         for p in ("J", "V"):
             log(f"recall on {p}:")
@@ -171,13 +177,26 @@ def _featurizer(split):
     return s1, sx, PairFeaturizer(s1, sx, load_token_arrays(work("tok", f"{split}.npz")))
 
 
-def _pruned_candidates(split, floor):
-    """Candidates with cos >= floor, plus per-S1 list features computed on the pruned lists."""
-    from .features import add_list_features
+def _pruned_candidates(split, floor, with_comp=True):
+    """Candidates with cos >= floor, plus per-S1 list features computed on the pruned lists and cross-S1
+    competition features. For train the competitor lists of the E-split S1s (cand/train_E.parquet) are
+    included so that every SX sees all its competing S1s, as it does on test."""
+    from .features import COMP_COLS, add_list_features, competition_features
     cand = pl.read_parquet(work("cand", f"{split}.parquet"))
     if floor is not None:
         cand = cand.filter(pl.col("cos") >= floor)
-    return add_list_features(cand)
+    cand = add_list_features(cand)
+    if not with_comp:
+        return cand
+    parts = [cand.select("s1", "sx", "cos", "cos_name")]
+    if split == "train":
+        e = pl.read_parquet(work("cand", "train_E.parquet"), columns=["s1", "sx", "cos", "cos_name"])
+        parts.append(e if floor is None else e.filter(pl.col("cos") >= floor))
+    allc = pl.concat(parts)
+    comp = competition_features(allc["sx"].to_numpy(), allc["cos"].to_numpy(), allc["cos_name"].to_numpy())
+    comp = comp[:cand.height]
+    del allc, parts
+    return cand.with_columns([pl.Series(c, comp[:, i]) for i, c in enumerate(COMP_COLS)])
 
 
 def _saved_floor():
@@ -203,8 +222,8 @@ def stage_features(args):
         c = cand.filter(pl.Series(part[cand["s1"].to_numpy()] == p))
         if p == "J":  # early-stopping slice (S1 row % 10 == 0) goes last
             c = c.with_columns((pl.col("s1") % 10 == 0).alias("ev")).sort("ev", "s1", "rank").drop("ev")
-        out = np.lib.format.open_memmap(work("feat", f"train_{p}.npy"), mode="w+", dtype=np.float32,
-                                        shape=(c.height, len(FEATURES)))
+        out = np.lib.format.open_memmap(work("feat", f"train_{p}.npy"), mode="w+", dtype=np.float16,
+                                        shape=(c.height, len(FEATURES)))  # float16 halves disk use
         for b in range(0, c.height, FEAT_CHUNK):
             out[b:b + FEAT_CHUNK] = fz.compute(c.slice(b, FEAT_CHUNK))
             log(f"  {p} features {min(b + FEAT_CHUNK, c.height)}/{c.height}")
@@ -216,7 +235,7 @@ def stage_features(args):
 
 def stage_train_judge(args):
     from . import judge
-    X = np.load(work("feat", "train_J.npy"))
+    X = np.load(work("feat", "train_J.npy")).astype(np.float32)
     pairs = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
     y = pairs["label"].to_numpy().astype(np.float32)
     n_eval = int((pairs["s1"] % 10 == 0).sum())
@@ -364,7 +383,7 @@ def stage_rethreshold(args):
         decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
-    cand = _pruned_candidates("test", decision["floor"])
+    cand = _pruned_candidates("test", decision["floor"], with_comp=False)
     p = np.load(work("pred", "test_p.npy"))
     s1r, sxr = cand["s1"].to_numpy(), cand["sx"].to_numpy()
     del cand
@@ -389,6 +408,8 @@ def main():
     ap.add_argument("--floor", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--k-addr", type=int, default=0, help="extra neighbours by address cosine (candidates)")
+    ap.add_argument("--queries", default="auto", choices=["auto", "E"],
+                    help="train candidates: auto = J+V S1s, E = encoder-split S1s (competitor lists)")
     ap.add_argument("--rule", default="threshold", choices=["threshold", "expected_f"])
     ap.add_argument("--thr", type=float, default=None)
     ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
