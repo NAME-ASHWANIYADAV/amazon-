@@ -202,20 +202,32 @@ def _featurizer(split):
     return s1, sx, PairFeaturizer(s1, sx, load_token_arrays(work("tok", f"{split}.npz")))
 
 
-def _pruned_candidates(split, floor, with_comp=True):
+def _pruned_candidates(split, floor, with_comp=True, dropped=None):
     """Candidates with cos >= floor, plus per-S1 list features computed on the pruned lists and cross-S1
     competition features. For train the competitor lists of the E-split S1s (cand/train_E.parquet) are
-    included so that every SX sees all its competing S1s, as it does on test."""
+    included so that every SX sees all its competing S1s, as it does on test.
+    dropped (bool per S1 row, optional): these S1s vanish as queries and as competitors, so their SX become
+    orphans the way SX of S1s missing from the test file are."""
     from .features import add_list_features
     cand = pl.read_parquet(work("cand", f"{split}.parquet"))
     if floor is not None:
         cand = cand.filter(pl.col("cos") >= floor)
+    if dropped is not None:
+        cand = cand.filter(pl.Series(~dropped[cand["s1"].to_numpy()]))
     cand = add_list_features(cand)
     if not with_comp:
         return cand
     extra = [pl.read_parquet(work("cand", "train_E.parquet"), columns=["s1", "sx", "cos", "cos_name"])] \
         if split == "train" else []
+    if dropped is not None:
+        extra = [e.filter(pl.Series(~dropped[e["s1"].to_numpy()])) for e in extra]
     return _with_competition(cand, extra)
+
+
+def _dropped_s1(n_s1):
+    """The simulated-missing S1 rows of train (models/dropped_s1.npy, written by `features --drop-frac`)."""
+    f = work("models", "dropped_s1.npy")
+    return np.load(f) if os.path.isfile(f) else np.zeros(n_s1, dtype=bool)
 
 
 def _with_competition(cand, extra_competitors=()):
@@ -257,11 +269,11 @@ def _stage_a_predict(cand, models, chunk=4_000_000):
     return out
 
 
-def _add_context(cand, tok, lo_extra, lo_miss):
+def _add_context(cand, tok, lo_extra, lo_miss, s1_present=None):
     """Generator-aware context columns (rows must be grouped by s1)."""
     from .context import CTX_COLS, context_features
     F = context_features(tok, cand["s1"].to_numpy(), cand["sx"].to_numpy(), cand["cos_name"].to_numpy(),
-                         cand["cos_addr"].to_numpy(), lo_extra, lo_miss)
+                         cand["cos_addr"].to_numpy(), lo_extra, lo_miss, s1_present)
     return cand.with_columns([pl.Series(c, F[:, i]) for i, c in enumerate(CTX_COLS)])
 
 
@@ -287,7 +299,14 @@ def stage_features(args):
     s1, sx = _load_split_frames("train")
     tok = load_token_arrays(work("tok", "train.npz"))
     fz = PairFeaturizer(s1, sx, tok)
-    cand = _pruned_candidates("train", args.floor)
+    dropped = np.random.default_rng(20260927).random(s1.height) < args.drop_frac
+    if args.drop_frac > 0:
+        np.save(work("models", "dropped_s1.npy"), dropped)
+        log(f"simulated missing S1s: {int(dropped.sum())} of {s1.height}")
+    elif os.path.isfile(work("models", "dropped_s1.npy")):
+        os.remove(work("models", "dropped_s1.npy"))
+    present = ~dropped
+    cand = _pruned_candidates("train", args.floor, dropped=dropped if args.drop_frac > 0 else None)
     part = s1["part"].to_numpy()
     gt = pl.read_parquet(work("prep", "train_gt_rows.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
     cand = (cand.join(gt.rename({"s1_row": "s1", "sx_row": "sx"}), on=["s1", "sx"], how="left")
@@ -327,9 +346,9 @@ def stage_features(args):
           for f in (0, 1)}
     lo_full = word_log_odds(tok, s1r[is_j], sxr[is_j], y[is_j])
     np.savez(work("models", "word_lo_train.npz"), extra=lo_full[0], miss=lo_full[1])
-    pieces = [_add_context(cand.filter(pl.Series(is_j & (fold == 0))), tok, *lo[1]),
-              _add_context(cand.filter(pl.Series(is_j & (fold == 1))), tok, *lo[0]),
-              _add_context(cand.filter(pl.Series(~is_j)), tok, *lo_full)]
+    pieces = [_add_context(cand.filter(pl.Series(is_j & (fold == 0))), tok, *lo[1], present),
+              _add_context(cand.filter(pl.Series(is_j & (fold == 1))), tok, *lo[0], present),
+              _add_context(cand.filter(pl.Series(~is_j)), tok, *lo_full, present)]
     cand = pl.concat(pieces)
     del pieces
     gc.collect()
@@ -400,7 +419,7 @@ def _validate_probs(p, decision_file):
     pairs = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
     s1r, sxr = pairs["s1"].to_numpy(), pairs["sx"].to_numpy()
     rng = np.random.default_rng(0)
-    v_rows = np.flatnonzero((s1["part"] == "V").to_numpy())
+    v_rows = np.flatnonzero((s1["part"] == "V").to_numpy() & ~_dropped_s1(s1.height))
     views = {"V": v_rows, "V-stress": v_rows[rng.random(len(v_rows)) >= 0.19]}
     results = {}
     for view, rows in views.items():
@@ -490,8 +509,8 @@ def stage_predict_stage2(args):
     from .io_utils import write_submission
     with open(work("models", "decision_s2.json")) as f:
         decision = json.load(f)
-    if args.country_thr:
-        decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
+    decision["country_thr"] = _country_map(args.country_thr)
+    decision["country_shift"] = _country_map(args.country_shift)
     tok = load_token_arrays(work("tok", "test.npz"))
     scored = pl.read_parquet(work("pred", "test_pairs_p.parquet"))
     s1r, sxr = scored["s1"].to_numpy(), scored["sx"].to_numpy()
@@ -517,8 +536,16 @@ def stage_predict_stage2(args):
 
 def _decide(s1r, sxr, p, decision, s1_country=None):
     """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
-    overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array)."""
+    overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array).
+    decision["country_shift"] (optional, any rule) adds a logit shift to the named countries' p first."""
     from .decide import assign_best, expected_f05_cut, threshold_cut
+    shifts = decision.get("country_shift") or {}
+    if shifts:
+        p = np.asarray(p, dtype=np.float32).copy()
+        for c, d in shifts.items():
+            m = s1_country[s1r] == c
+            z = np.log(np.clip(p[m], 1e-6, 1 - 1e-6) / np.clip(1 - p[m], 1e-6, 1)) + d
+            p[m] = 1.0 / (1.0 + np.exp(-z))
     keep = assign_best(sxr, p)
     mask = np.zeros(len(p), dtype=bool)
     idx = np.flatnonzero(keep)
@@ -617,18 +644,23 @@ def stage_predict_test(args):
     _run_validator()
 
 
+def _country_map(spec):
+    return {k: float(v) for k, v in (kv.split("=") for kv in spec.split(","))} if spec else {}
+
+
 def stage_rethreshold(args):
+    """Re-decide saved test probabilities (stage 1 by default, --stage2 for the stage-2 ones)."""
     import json
 
     from .io_utils import write_submission
-    with open(work("models", "decision.json")) as f:
+    with open(work("models", "decision_s2.json" if args.stage2 else "decision.json")) as f:
         decision = json.load(f)
     decision.update({"rule": args.rule, "threshold": args.thr if args.thr is not None else decision["threshold"]})
-    if args.country_thr:
-        decision["country_thr"] = {k: float(v) for k, v in (kv.split("=") for kv in args.country_thr.split(","))}
+    decision["country_thr"] = _country_map(args.country_thr)
+    decision["country_shift"] = _country_map(args.country_shift)
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
-    scored = pl.read_parquet(work("pred", "test_pairs_p.parquet"))
+    scored = pl.read_parquet(work("pred", "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
     s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
     del scored
     mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy())
@@ -658,6 +690,10 @@ def main():
     ap.add_argument("--rule", default="threshold", choices=["threshold", "expected_f"])
     ap.add_argument("--thr", type=float, default=None)
     ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
+    ap.add_argument("--country-shift", default="", help="per-country logit shifts of p, e.g. France=-0.9")
+    ap.add_argument("--stage2", action="store_true", help="rethreshold: use the stage-2 probabilities")
+    ap.add_argument("--drop-frac", type=float, default=0.0,
+                    help="features: simulate this share of S1s missing (as in test) for training and V")
     args = ap.parse_args()
     STAGES[args.stage](args)
 

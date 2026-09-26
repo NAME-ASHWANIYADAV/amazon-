@@ -84,6 +84,8 @@ def test_global_name_counts_lookup():
     h1, hx, counts, empty = global_name_counts(tok)
     assert counts(hx, h1).tolist() == [2, 0, 2, 1]        # S1s sharing each SX core name
     assert counts(hx, hx[empty]).tolist() == [2, 0, 2, 0]  # empty-address SX sharing it
+    h1, hx, counts, _ = global_name_counts(tok, s1_present=np.array([True, False, True]))
+    assert counts(hx, h1).tolist() == [1, 0, 1, 1]        # the dropped S1 no longer counts
 
 
 def test_stage2_features_counts():

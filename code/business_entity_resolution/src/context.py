@@ -209,9 +209,12 @@ def extra_word_features(tok, s1r, sxr, lo_extra, lo_miss):
     return out
 
 
-def global_name_counts(tok):
-    """Per-record counts over the whole split: S1s with the same core name, SX with it, empty-address SX."""
+def global_name_counts(tok, s1_present=None):
+    """Per-record counts over the whole split: S1s with the same core name, SX with it, empty-address SX.
+    s1_present (bool per S1 row, optional): only these S1s count (the simulated-drop training view)."""
     h1 = core_hash(tok["ns1_ptr"], tok["ns1_ids"])
+    if s1_present is not None:
+        h1 = np.where(s1_present, h1, -1)   # -1 never equals a core hash (hashes are >= 0)
     hx = core_hash(tok["nsx_ptr"], tok["nsx_ids"])
     empty = tok["flags_sx"][:, 2] > 0
 
@@ -294,8 +297,9 @@ def stage2_features(tok, s1r, sxr, p1):
     return out
 
 
-def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss):
-    """All CTX_COLS for candidate pairs grouped by s1 (s1r sorted/grouped). Returns float32 (n, len(CTX_COLS))."""
+def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss, s1_present=None):
+    """All CTX_COLS for candidate pairs grouped by s1 (s1r sorted/grouped). Returns float32 (n, len(CTX_COLS)).
+    s1_present: see global_name_counts."""
     s1r64, sxr64 = s1r.astype(np.int64), sxr.astype(np.int64)
     n = len(s1r64)
     out = np.zeros((n, len(CTX_COLS)), dtype=np.float32)
@@ -307,7 +311,7 @@ def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss):
                      DISTRACTOR_SHIFTS, off, bval, flags)
     out[:, col["hn_off"]] = off
     out[:, col["hn_in_set"]:col["hn_composite"] + 1] = flags
-    h1, hx, counts, empty = global_name_counts(tok)
+    h1, hx, counts, empty = global_name_counts(tok, s1_present)
     sx_key, s1_key = hx[sxr64], h1[s1r64]
     lc = np.zeros((n, 5), dtype=np.float32)
     list_context(s1r64, off, bval, cos_name.astype(np.float32), cos_addr.astype(np.float32), empty[sxr64],
