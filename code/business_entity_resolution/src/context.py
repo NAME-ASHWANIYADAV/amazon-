@@ -209,13 +209,24 @@ def extra_word_features(tok, s1r, sxr, lo_extra, lo_miss):
     return out
 
 
+_MASK60 = (1 << 60) - 1
+
+
+def _with_country(h, cc):
+    """Core-name hash made country-specific (bits 60-61 = country code); 0 (empty name) stays 0."""
+    return np.where(h == 0, 0, (h & _MASK60) | (cc.astype(np.int64) << 60))
+
+
 def global_name_counts(tok, s1_present=None):
     """Per-record counts over the whole split: S1s with the same core name, SX with it, empty-address SX.
-    s1_present (bool per S1 row, optional): only these S1s count (the simulated-drop training view)."""
+    s1_present (bool per S1 row, optional): only these S1s count (the simulated-drop training view).
+    With tok["cc_s1"/"cc_sx"] (country codes) names are counted within their own country."""
     h1 = core_hash(tok["ns1_ptr"], tok["ns1_ids"])
+    hx = core_hash(tok["nsx_ptr"], tok["nsx_ids"])
+    if "cc_s1" in tok:
+        h1, hx = _with_country(h1, tok["cc_s1"]), _with_country(hx, tok["cc_sx"])
     if s1_present is not None:
         h1 = np.where(s1_present, h1, -1)   # -1 never equals a core hash (hashes are >= 0)
-    hx = core_hash(tok["nsx_ptr"], tok["nsx_ids"])
     empty = tok["flags_sx"][:, 2] > 0
 
     def counts(keys, values):
@@ -320,9 +331,19 @@ def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss, s1_pr
     n_s1 = counts(sx_key, h1)
     n_sx = counts(sx_key, hx)
     n_emp = counts(sx_key, hx[empty])
+    out[:, col["g_emp_ratio"]] = n_emp / np.maximum(n_s1, 1)
+    if "cc_s1" in tok:
+        # counts as rates of the country's size (S1s per 100k present S1s, SX per 1M SX): raw counts scale with
+        # the split (test US has 0.62x the S1s of train US), which made test names look rare to the judge
+        pres = np.ones(len(h1), dtype=bool) if s1_present is None else s1_present
+        n1c = np.bincount(tok["cc_s1"][pres], minlength=4).astype(np.float64)
+        nxc = np.bincount(tok["cc_sx"], minlength=4).astype(np.float64)
+        c = tok["cc_s1"][s1r64]
+        n_s1 = n_s1 * (1e5 / np.maximum(n1c, 1))[c]
+        n_sx = n_sx * (1e6 / np.maximum(nxc, 1))[c]
+        n_emp = n_emp * (1e6 / np.maximum(nxc, 1))[c]
     out[:, col["g_n_s1_core"]] = n_s1
     out[:, col["g_n_sx_core"]] = n_sx
     out[:, col["g_n_sxemp_core"]] = n_emp
-    out[:, col["g_emp_ratio"]] = n_emp / np.maximum(n_s1, 1)
     out[:, col["xw_lo_max"]:col["mw_n_miss"] + 1] = extra_word_features(tok, s1r64, sxr64, lo_extra, lo_miss)
     return out

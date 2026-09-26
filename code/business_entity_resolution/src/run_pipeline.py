@@ -191,6 +191,17 @@ def stage_address_pass(args):
 FEAT_CHUNK = 2_000_000
 
 
+def _load_tok(split):
+    """Token arrays of a split plus per-record country codes (cc_s1, cc_sx), which make idf and global name
+    counts per-country and size-normalised (features.country_idf, context.global_name_counts)."""
+    from .features import COUNTRY_CODES, load_token_arrays
+    tok = load_token_arrays(work("tok", f"{split}.npz"))
+    for which in ("s1", "sx"):
+        tok[f"cc_{which}"] = (load_prep(split, which, ["country"])["country"]
+                              .replace_strict(COUNTRY_CODES, default=3, return_dtype=pl.Int8).to_numpy())
+    return tok
+
+
 def _load_split_frames(split):
     """Only the string columns the featurizer reads directly (everything else is in the token arrays)."""
     s1 = load_prep(split, "s1", ["name_core", "addr_norm", "entity_id", "country"]
@@ -215,7 +226,7 @@ def stage_tokens(args):
 def _featurizer(split):
     from .features import PairFeaturizer, load_token_arrays
     s1, sx = _load_split_frames(split)
-    return s1, sx, PairFeaturizer(s1, sx, load_token_arrays(work("tok", f"{split}.npz")))
+    return s1, sx, PairFeaturizer(s1, sx, _load_tok(split))
 
 
 def _pruned_candidates(split, floor, with_comp=True, dropped=None):
@@ -313,7 +324,7 @@ def stage_features(args):
     with open(work("models", "floor.json"), "w") as f:
         json.dump({"floor": args.floor}, f)
     s1, sx = _load_split_frames("train")
-    tok = load_token_arrays(work("tok", "train.npz"))
+    tok = _load_tok("train")
     fz = PairFeaturizer(s1, sx, tok)
     dropped = np.random.default_rng(20260927).random(s1.height) < args.drop_frac
     if args.drop_frac > 0:
@@ -500,7 +511,7 @@ def _stage2_models_and_probs(XJ, pj, XV, pv, tok):
 def stage_stage2(args):
     """Train the stacked stage-2 judge on J and validate it on V (writes models/decision_s2.json)."""
     from .features import load_token_arrays
-    tok = load_token_arrays(work("tok", "train.npz"))
+    tok = _load_tok("train")
     XJ = np.load(work("feat", "train_J.npy")).astype(np.float32)
     XV = np.load(work("feat", "train_V.npy")).astype(np.float32)
     pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
@@ -527,7 +538,7 @@ def stage_predict_stage2(args):
         decision = json.load(f)
     decision["country_thr"] = _country_map(args.country_thr)
     decision["country_shift"] = _country_map(args.country_shift)
-    tok = load_token_arrays(work("tok", "test.npz"))
+    tok = _load_tok("test")
     scored = pl.read_parquet(work("pred", "test_pairs_p.parquet"))
     s1r, sxr = scored["s1"].to_numpy(), scored["sx"].to_numpy()
     X = np.load(work("feat", "test.npy"), mmap_mode="r")
@@ -624,7 +635,7 @@ def stage_predict_test(args):
     country = load_prep("test", "s1", ["country"])["country"].to_numpy()
     names, code = np.unique(country, return_inverse=True)
     code = code.astype(np.int8)
-    tok = load_token_arrays(work("tok", "test.npz"))
+    tok = _load_tok("test")
     models_a = [xgb.Booster(model_file=work("models", f"stage_a_{f}.json")) for f in (0, 1)]
 
     # list + competition features and the stage-A filter, one country at a time. Each country's candidates

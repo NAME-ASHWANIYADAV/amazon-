@@ -178,31 +178,50 @@ def add_list_features(cand):
                              pl.Series("list_size", rep(counts)))
 
 
+COUNTRY_CODES = {"France": 0, "India": 1, "US": 2}   # 3 = anything else
+N_CODES = 4
+
+
+def country_idf(ptr, ids, rec_cc, vocab_size):
+    """idf per country (rows = country code) over that country's SX records. One idf over the whole split is
+    not comparable between train and test: test US has 0.62x the SX of train US while the split total barely
+    changes, which inflated every US token's idf by ~0.45 and made US names look rarer (over-matching)."""
+    rec_of_tok = np.repeat(np.arange(len(ptr) - 1, dtype=np.int32), np.diff(ptr))
+    cc = rec_cc[rec_of_tok]
+    out = np.empty((N_CODES, vocab_size), dtype=np.float32)
+    for c in range(N_CODES):
+        n_docs = int((rec_cc == c).sum())
+        df = np.bincount(ids[cc == c], minlength=vocab_size).astype(np.float32)
+        out[c] = np.log((n_docs + 1) / (df + 1)) + 1.0
+    return out
+
+
 @numba.njit(parallel=True, cache=True)
-def _set_feats(a_ptr, a_ids, b_ptr, b_ids, idf, pa, pb, out):
-    """out: inter, |A|, |B|, idf(A∩B), idf(A∪B)."""
+def _set_feats(a_ptr, a_ids, b_ptr, b_ids, idf, cc, pa, pb, out):
+    """out: inter, |A|, |B|, idf(A∩B), idf(A∪B). idf: (countries, vocab); cc: country code per pair."""
     for q in numba.prange(len(pa)):
         i, j = pa[q], pb[q]
+        c = cc[q]
         x, xe, y, ye = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
         inter, wi, wu = 0, 0.0, 0.0
         while x < xe and y < ye:
             if a_ids[x] == b_ids[y]:
                 inter += 1
-                wi += idf[a_ids[x]]
-                wu += idf[a_ids[x]]
+                wi += idf[c, a_ids[x]]
+                wu += idf[c, a_ids[x]]
                 x += 1
                 y += 1
             elif a_ids[x] < b_ids[y]:
-                wu += idf[a_ids[x]]
+                wu += idf[c, a_ids[x]]
                 x += 1
             else:
-                wu += idf[b_ids[y]]
+                wu += idf[c, b_ids[y]]
                 y += 1
         while x < xe:
-            wu += idf[a_ids[x]]
+            wu += idf[c, a_ids[x]]
             x += 1
         while y < ye:
-            wu += idf[b_ids[y]]
+            wu += idf[c, b_ids[y]]
             y += 1
         out[q, 0] = inter
         out[q, 1] = a_ptr[i + 1] - a_ptr[i]
@@ -340,7 +359,13 @@ class PairFeaturizer:
         self.n1, self.nx = (tok["ns1_ptr"], tok["ns1_ids"]), (tok["nsx_ptr"], tok["nsx_ids"])
         self.a1, self.ax = (tok["as1_ptr"], tok["as1_ids"]), (tok["asx_ptr"], tok["asx_ids"])
         self.num1, self.numx = (tok["nums1_ptr"], tok["nums1_val"]), (tok["numsx_ptr"], tok["numsx_val"])
-        self.idf_n, self.idf_a = tok["idf_n"], tok["idf_a"]
+        if "cc_s1" in tok:   # per-country idf (see country_idf)
+            self.cc1 = tok["cc_s1"].astype(np.int64)
+            self.idf_n = country_idf(tok["nsx_ptr"], tok["nsx_ids"], tok["cc_sx"], len(tok["idf_n"]))
+            self.idf_a = country_idf(tok["asx_ptr"], tok["asx_ids"], tok["cc_sx"], len(tok["idf_a"]))
+        else:
+            self.cc1 = np.zeros(len(tok["ns1_ptr"]) - 1, dtype=np.int64)
+            self.idf_n, self.idf_a = tok["idf_n"][None, :], tok["idf_a"][None, :]
         self.legal_M, self.legal1, self.legalx = tok["legal_M"], tok["legal_s1"], tok["legal_sx"]
         self.flags_x = tok["flags_sx"]
 
@@ -354,14 +379,15 @@ class PairFeaturizer:
             X[:, col[f]] = cand[f].to_numpy()
 
         o = np.zeros((n, 5), dtype=np.float32)
-        _set_feats(self.n1[0], self.n1[1], self.nx[0], self.nx[1], self.idf_n, s1r, sxr, o)
+        cc = self.cc1[s1r]
+        _set_feats(self.n1[0], self.n1[1], self.nx[0], self.nx[1], self.idf_n, cc, s1r, sxr, o)
         X[:, col["name_inter"]], X[:, col["name_len1"]], X[:, col["name_lenx"]] = o[:, 0], o[:, 1], o[:, 2]
         X[:, col["name_jacc"]] = o[:, 0] / np.maximum(o[:, 1] + o[:, 2] - o[:, 0], 1)
         X[:, col["name_cont1"]] = o[:, 0] / np.maximum(o[:, 1], 1)
         X[:, col["name_contx"]] = o[:, 0] / np.maximum(o[:, 2], 1)
         X[:, col["name_idf_jacc"]] = o[:, 3] / np.maximum(o[:, 4], 1e-6)
         X[:, col["name_idf_inter"]] = o[:, 3]
-        _set_feats(self.a1[0], self.a1[1], self.ax[0], self.ax[1], self.idf_a, s1r, sxr, o)
+        _set_feats(self.a1[0], self.a1[1], self.ax[0], self.ax[1], self.idf_a, cc, s1r, sxr, o)
         X[:, col["addr_inter"]], X[:, col["addr_len1"]], X[:, col["addr_lenx"]] = o[:, 0], o[:, 1], o[:, 2]
         X[:, col["addr_jacc"]] = o[:, 0] / np.maximum(o[:, 1] + o[:, 2] - o[:, 0], 1)
         X[:, col["addr_idf_jacc"]] = o[:, 3] / np.maximum(o[:, 4], 1e-6)
