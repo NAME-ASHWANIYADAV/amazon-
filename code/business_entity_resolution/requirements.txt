@@ -1,0 +1,8 @@
+numpy==2.2.1
+polars==1.41.2
+pyarrow==24.0.0
+numba==0.60.0
+torch==2.12.0+cu126
+xgboost==3.4.1
+rapidfuzz==3.14.6
+pytest
