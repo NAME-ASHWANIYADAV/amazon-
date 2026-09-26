@@ -23,3 +23,14 @@ def test_typo_shares_ngrams():
 
 def test_deterministic():
     assert hash_features(["lucas and lee"], 0)[0].tolist() == hash_features(["lucas and lee"], 0)[0].tolist()
+
+
+def test_acronym_code():
+    from src.features import acronym_code
+    assert acronym_code("tourcoing societe", "ts") == 1
+    assert acronym_code("dunkerque parents", "d p") == 1
+    assert acronym_code("ts", "tourcoing societe") == 2
+    assert acronym_code("tourcoing", "t") == 0            # one token: no acronym
+    assert acronym_code("tourcoing societe", "tx") == 0
+    assert acronym_code("a b c d e f g", "abcdefg") == 0  # longer than 6 letters
+    assert acronym_code("", "") == 0

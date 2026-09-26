@@ -542,19 +542,38 @@ def stage_predict_stage2(args):
     pl.DataFrame({"s1": s1r, "sx": sxr, "p": p2}).write_parquet(work("pred", "test_pairs_p2.parquet"))
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
-    mask = _decide(s1r, sxr, p2, decision, s1_country=s1["country"].to_numpy())
+    reject = shift_rule_mask(X) if args.shift_rule else None
+    mask = _decide(s1r, sxr, p2, decision, s1_country=s1["country"].to_numpy(), reject=reject)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
-    log("stage-2 matched pairs", int(mask.sum()), decision)
+    log("stage-2 matched pairs", int(mask.sum()), decision, "shift rule" if args.shift_rule else "")
     del sx_ids, X
     gc.collect()
     _run_validator()
 
 
-def _decide(s1r, sxr, p, decision, s1_country=None):
+SHIFT_RULE_COLS = ("hn_in_set", "hn_off", "hn_sib_1")
+
+
+def shift_rule_mask(X):
+    """Pairs whose SX house number is the S1 number plus a distractor shift of 3 or more although other
+    name-similar copies confirm the S1 number. Train has such true copies only rarely (0.002 predicted per S1
+    on V, cost of dropping them 0.00013 V), while test US predicts 0.11 per S1 of them, mostly fake businesses
+    that come with 2+ copies at the shifted number. X: a feature matrix (70-column files predate 'acro')."""
+    from .features import FEATURES
+    names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
+    M = np.asarray(X[:, [names.index(c) for c in SHIFT_RULE_COLS]], dtype=np.float32)
+    return (M[:, 0] > 0.5) & (M[:, 1] >= 3) & (M[:, 2] >= 1)
+
+
+def _decide(s1r, sxr, p, decision, s1_country=None, reject=None):
     """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
     overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array).
-    decision["country_shift"] (optional, any rule) adds a logit shift to the named countries' p first."""
+    decision["country_shift"] (optional, any rule) adds a logit shift to the named countries' p first.
+    reject (optional bool per pair): pairs that are never matched (p set to 0 before assignment)."""
     from .decide import assign_best, expected_f05_cut, threshold_cut
+    if reject is not None:
+        p = np.where(reject, np.float32(0), np.asarray(p, dtype=np.float32))
+        log(f"rejected {int(reject.sum())} pairs by rule")
     shifts = decision.get("country_shift") or {}
     if shifts:
         p = np.asarray(p, dtype=np.float32).copy()
@@ -659,7 +678,8 @@ def stage_predict_test(args):
     s1_ids, sx_ids = s1["entity_id"].to_list(), sx["entity_id"].to_numpy()
     del cand, fz, s1, sx, tok
     gc.collect()
-    mask = _decide(s1r, sxr, p, decision, s1_country=country)
+    reject = shift_rule_mask(np.load(work("feat", "test.npy"), mmap_mode="r")) if args.shift_rule else None
+    mask = _decide(s1r, sxr, p, decision, s1_country=country, reject=reject)
     write_submission(config.OUT_DIR, s1_ids, sx_ids, s1r, sxr, mask)
     log("matched pairs", int(mask.sum()), "S1 with >=1 match", len(np.unique(s1r[mask])), "of", len(s1_ids))
     del sx_ids, s1r, sxr, p, mask
@@ -686,7 +706,13 @@ def stage_rethreshold(args):
     scored = pl.read_parquet(work("pred", "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
     s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
     del scored
-    mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy())
+    reject = None
+    if args.shift_rule:   # test.npy rows are aligned with the scored pairs (both in predict-test order)
+        X = np.load(work("feat", "test.npy"), mmap_mode="r")
+        assert X.shape[0] == len(p), "feat/test.npy is not from the run that scored these pairs"
+        reject = shift_rule_mask(X)
+        del X
+    mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -715,6 +741,8 @@ def main():
     ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
     ap.add_argument("--country-shift", default="", help="per-country logit shifts of p, e.g. France=-0.9")
     ap.add_argument("--stage2", action="store_true", help="rethreshold: use the stage-2 probabilities")
+    ap.add_argument("--shift-rule", action="store_true",
+                    help="never match an SX shifted by a distractor offset >= 3 when copies confirm the S1 number")
     ap.add_argument("--drop-frac", type=float, default=0.0,
                     help="features: simulate this share of S1s missing (as in test) for training and V")
     args = ap.parse_args()

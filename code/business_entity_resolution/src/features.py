@@ -14,7 +14,7 @@ FEATURES = [
     "addr_inter", "addr_len1", "addr_lenx", "addr_jacc", "addr_idf_jacc", "addr_tset", "addr_ratio",
     "num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
     "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel",
-    "was_indic", "is_domain", "addr_empty_x", "is_s3"]
+    "was_indic", "is_domain", "addr_empty_x", "is_s3", "acro"]
 NUM_COLS = ["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
             "num_x_unmatched", "num_x_primary_in_1", "num_prim_logdiff", "num_prim_rel"]
 # Cross-S1 competition: how this S1 compares with every other S1 whose candidate list contains the same SX.
@@ -319,6 +319,18 @@ def load_token_arrays(path):
         return {k: z[k] for k in z.files}
 
 
+def acronym_code(core_a, core_b):
+    """1 if name core b (spaces removed, 2-6 letters) is the initials of core a's 2+ tokens, 2 if a is the
+    initials of b, else 0. The generator abbreviates names this way ('tourcoing societe' -> 'ts'), far more
+    often in France than in the training countries."""
+    def is_acro(full, short):
+        s = short.replace(" ", "")
+        t = full.split()
+        return len(t) >= 2 and 2 <= len(s) <= 6 and s.isalpha() and len(short.split()) <= 3 and \
+            s == "".join(w[0] for w in t)
+    return 1 if is_acro(core_a, core_b) else 2 if is_acro(core_b, core_a) else 0
+
+
 class PairFeaturizer:
     """Computes features for candidate chunks from precomputed token arrays (build_token_arrays) plus
     the string columns rapidfuzz needs: s1[name_core, addr_norm], sx[name_core, alt_core, addr_norm]."""
@@ -373,6 +385,7 @@ class PairFeaturizer:
         for q in np.flatnonzero(np.fromiter((bool(a) for a in altx), dtype=bool, count=n)):
             alt[q] = max(fuzz.token_set_ratio(c1[q], part) for part in altx[q].split("|")) / 100.0
         X[:, col["alt_best"]] = alt
+        X[:, col["acro"]] = np.fromiter((acronym_code(a, b) for a, b in zip(c1, cx)), dtype=np.float32, count=n)
         X[:, col["legal_code"]] = self.legal_M[self.legal1[s1r], self.legalx[sxr]]
         a1 = self.s1["addr_norm"].gather(s1r).to_list()
         ax = self.sx["addr_norm"].gather(sxr).to_list()
