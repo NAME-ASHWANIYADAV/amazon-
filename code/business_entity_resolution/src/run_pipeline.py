@@ -445,8 +445,10 @@ def _stage2_models_and_probs(XJ, pj, XV, pv, tok):
     p1j = np.empty(len(yj), dtype=np.float32)
     fold_models = []
     for f in (0, 1):
-        tr = fold == f  # rows keep the (ev last) order, so the eval slice stays at the end
-        m = judge.train(XJ[tr], yj[tr], int((ev & tr).sum()))
+        idx = np.flatnonzero(fold == f)
+        ev_f = (s1j[idx] // 2) % 10 == 0  # early-stopping slice inside the fold (s1 % 10 is always even)
+        idx = np.r_[idx[~ev_f], idx[ev_f]]
+        m = judge.train(XJ[idx], yj[idx], int(ev_f.sum()))
         m.save_model(work("models", f"judge_f{f}.json"))
         fold_models.append(m)
         p1j[fold != f] = judge.predict(m, XJ[fold != f])
