@@ -1,0 +1,228 @@
+"""Pair features for the judge: embedding cosines, token-set overlaps, fuzzy scores, numbers, flags."""
+from array import array
+
+import numba
+import numpy as np
+import polars as pl
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
+
+FEATURES = [
+    "cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size",
+    "name_inter", "name_len1", "name_lenx", "name_jacc", "name_cont1", "name_contx", "name_idf_jacc",
+    "name_idf_inter", "tset", "tsort", "partial", "ratio", "nospace", "jw", "alt_best", "legal_code",
+    "addr_inter", "addr_len1", "addr_lenx", "addr_jacc", "addr_idf_jacc", "addr_tset", "addr_ratio",
+    "num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1", "num_nx",
+    "num_x_unmatched", "num_x_primary_in_1", "was_indic", "is_domain", "addr_empty_x", "is_s3"]
+
+
+def _token_csr(strings, vocab, skip_digits=False):
+    """Space-separated tokens -> (indptr, sorted unique int32 ids); vocab grows in place."""
+    indptr = np.zeros(len(strings) + 1, dtype=np.int64)
+    ids = array("i")
+    for r, s in enumerate(strings):
+        if s:
+            ids.extend(sorted({vocab.setdefault(t, len(vocab)) for t in s.split()
+                               if not (skip_digits and t.isdigit())}))
+        indptr[r + 1] = len(ids)
+    return indptr, np.frombuffer(ids, dtype=np.int32).copy()
+
+
+def _number_csr(strings):
+    indptr = np.zeros(len(strings) + 1, dtype=np.int64)
+    vals = array("q")
+    for r, s in enumerate(strings):
+        if s:
+            vals.extend(int(t[:15]) for t in s.split())
+        indptr[r + 1] = len(vals)
+    return indptr, np.frombuffer(vals, dtype=np.int64).copy()
+
+
+def add_list_features(cand):
+    """Per-S1 list context (needs the whole candidate list, so run before chunking).
+    `cand` must be grouped by s1 (it is sorted by s1, rank)."""
+    s1r, cos = cand["s1"].to_numpy(), cand["cos"].to_numpy().astype(np.float32)
+    starts = np.flatnonzero(np.r_[True, s1r[1:] != s1r[:-1]])
+    counts = np.diff(np.r_[starts, len(s1r)])
+    mx = np.maximum.reduceat(cos, starts)
+    mu = np.add.reduceat(cos, starts) / counts
+    sd = np.sqrt(np.maximum(np.add.reduceat(cos * cos, starts) / counts - mu * mu, 0))
+    rep = lambda v: np.repeat(v, counts).astype(np.float32)
+    return cand.with_columns(pl.Series("gap_best", rep(mx) - cos),
+                             pl.Series("z_in_list", (cos - rep(mu)) / (rep(sd) + 1e-3)),
+                             pl.Series("list_size", rep(counts)))
+
+
+@numba.njit(parallel=True, cache=True)
+def _set_feats(a_ptr, a_ids, b_ptr, b_ids, idf, pa, pb, out):
+    """out: inter, |A|, |B|, idf(A∩B), idf(A∪B)."""
+    for q in numba.prange(len(pa)):
+        i, j = pa[q], pb[q]
+        x, xe, y, ye = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        inter, wi, wu = 0, 0.0, 0.0
+        while x < xe and y < ye:
+            if a_ids[x] == b_ids[y]:
+                inter += 1
+                wi += idf[a_ids[x]]
+                wu += idf[a_ids[x]]
+                x += 1
+                y += 1
+            elif a_ids[x] < b_ids[y]:
+                wu += idf[a_ids[x]]
+                x += 1
+            else:
+                wu += idf[b_ids[y]]
+                y += 1
+        while x < xe:
+            wu += idf[a_ids[x]]
+            x += 1
+        while y < ye:
+            wu += idf[b_ids[y]]
+            y += 1
+        out[q, 0] = inter
+        out[q, 1] = a_ptr[i + 1] - a_ptr[i]
+        out[q, 2] = b_ptr[j + 1] - b_ptr[j]
+        out[q, 3] = wi
+        out[q, 4] = wu
+
+
+@numba.njit(parallel=True, cache=True)
+def _num_feats(a_ptr, a_val, b_ptr, b_val, pa, pb, out):
+    """out: primary_eq, any_eq, log1p(min|diff|), min rel diff, n_a, n_b, b_unmatched, b_primary_in_a.
+    -1 marks 'not applicable' (a side without numbers)."""
+    for q in numba.prange(len(pa)):
+        i, j = pa[q], pb[q]
+        x0, x1, y0, y1 = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        out[q, 4] = x1 - x0
+        out[q, 5] = y1 - y0
+        if x1 == x0 or y1 == y0:
+            out[q, 0] = -1.0
+            out[q, 1] = -1.0
+            out[q, 2] = -1.0
+            out[q, 3] = -1.0
+            out[q, 7] = -1.0
+            out[q, 6] = y1 - y0
+            continue
+        prim = a_val[x0]
+        peq, anyeq, unmatched = 0, 0, 0
+        best, brel = 1e18, 1e18
+        for y in range(y0, y1):
+            v = b_val[y]
+            if v == prim:
+                peq = 1
+            found = 0
+            for x in range(x0, x1):
+                u = a_val[x]
+                if u == v:
+                    found = 1
+                d = float(abs(u - v))
+                if d < best:
+                    best = d
+                r = d / max(u, v, 1)
+                if r < brel:
+                    brel = r
+            if found:
+                anyeq = 1
+            else:
+                unmatched += 1
+        bprim = 0
+        for x in range(x0, x1):
+            if a_val[x] == b_val[y0]:
+                bprim = 1
+        out[q, 0] = peq
+        out[q, 1] = anyeq
+        out[q, 2] = np.log1p(best)
+        out[q, 3] = brel
+        out[q, 6] = unmatched
+        out[q, 7] = bprim
+
+
+def _legal_matrix(uniq):
+    M = np.zeros((len(uniq), len(uniq)), dtype=np.float32)
+    sets = [set(u.split()) for u in uniq]
+    for a, sa in enumerate(sets):
+        for b, sb in enumerate(sets):
+            M[a, b] = (0 if not sa and not sb else 1 if sa == sb else 2 if not sa or not sb
+                       else 3 if sa & sb else 4)
+    return M
+
+
+def _cp(scorer, a, b):
+    return process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32) / 100.0
+
+
+class PairFeaturizer:
+    """Holds per-record token structures for one split; computes features for candidate chunks."""
+
+    def __init__(self, s1, sx):
+        self.s1, self.sx = s1, sx
+        vocab_n, vocab_a = {}, {}
+        self.n1 = _token_csr(s1["name_core"].to_list(), vocab_n)
+        self.nx = _token_csr(sx["name_core"].to_list(), vocab_n)
+        self.a1 = _token_csr(s1["addr_norm"].to_list(), vocab_a, skip_digits=True)
+        self.ax = _token_csr(sx["addr_norm"].to_list(), vocab_a, skip_digits=True)
+        self.num1 = _number_csr(s1["numbers"].to_list())
+        self.numx = _number_csr(sx["numbers"].to_list())
+        self.idf_n = self._idf(self.nx, len(vocab_n), sx.height)
+        self.idf_a = self._idf(self.ax, len(vocab_a), sx.height)
+        uniq = sorted(set(s1["legal"].unique().to_list()) | set(sx["legal"].unique().to_list()))
+        code = {u: i for i, u in enumerate(uniq)}
+        self.legal_M = _legal_matrix(uniq)
+        self.legal1 = np.array([code[u] for u in s1["legal"].to_list()], dtype=np.int32)
+        self.legalx = np.array([code[u] for u in sx["legal"].to_list()], dtype=np.int32)
+        self.flags_x = np.stack([sx["was_indic"].to_numpy(), sx["is_domain"].to_numpy(),
+                                 sx["addr_empty"].to_numpy(), (sx["src"] == 3).to_numpy()], 1).astype(np.float32)
+
+    @staticmethod
+    def _idf(csr, n_vocab, n_docs):
+        df = np.bincount(csr[1], minlength=n_vocab).astype(np.float32)
+        return np.log((n_docs + 1) / (df + 1)).astype(np.float32) + 1.0
+
+    def compute(self, cand):
+        s1r, sxr = cand["s1"].to_numpy().astype(np.int64), cand["sx"].to_numpy().astype(np.int64)
+        n = len(s1r)
+        X = np.zeros((n, len(FEATURES)), dtype=np.float32)
+        col = {f: i for i, f in enumerate(FEATURES)}
+        for f in ("cos", "cos_name", "cos_addr", "rank", "gap_best", "z_in_list", "list_size"):
+            X[:, col[f]] = cand[f].to_numpy()
+
+        o = np.zeros((n, 5), dtype=np.float32)
+        _set_feats(self.n1[0], self.n1[1], self.nx[0], self.nx[1], self.idf_n, s1r, sxr, o)
+        X[:, col["name_inter"]], X[:, col["name_len1"]], X[:, col["name_lenx"]] = o[:, 0], o[:, 1], o[:, 2]
+        X[:, col["name_jacc"]] = o[:, 0] / np.maximum(o[:, 1] + o[:, 2] - o[:, 0], 1)
+        X[:, col["name_cont1"]] = o[:, 0] / np.maximum(o[:, 1], 1)
+        X[:, col["name_contx"]] = o[:, 0] / np.maximum(o[:, 2], 1)
+        X[:, col["name_idf_jacc"]] = o[:, 3] / np.maximum(o[:, 4], 1e-6)
+        X[:, col["name_idf_inter"]] = o[:, 3]
+        _set_feats(self.a1[0], self.a1[1], self.ax[0], self.ax[1], self.idf_a, s1r, sxr, o)
+        X[:, col["addr_inter"]], X[:, col["addr_len1"]], X[:, col["addr_lenx"]] = o[:, 0], o[:, 1], o[:, 2]
+        X[:, col["addr_jacc"]] = o[:, 0] / np.maximum(o[:, 1] + o[:, 2] - o[:, 0], 1)
+        X[:, col["addr_idf_jacc"]] = o[:, 3] / np.maximum(o[:, 4], 1e-6)
+
+        on = np.zeros((n, 8), dtype=np.float32)
+        _num_feats(self.num1[0], self.num1[1], self.numx[0], self.numx[1], s1r, sxr, on)
+        for c, f in enumerate(["num_primary_eq", "num_any_eq", "num_log_mindiff", "num_min_rel", "num_n1",
+                               "num_nx", "num_x_unmatched", "num_x_primary_in_1"]):
+            X[:, col[f]] = on[:, c]
+
+        c1 = self.s1["name_core"].gather(s1r).to_list()
+        cx = self.sx["name_core"].gather(sxr).to_list()
+        X[:, col["tset"]] = _cp(fuzz.token_set_ratio, c1, cx)
+        X[:, col["tsort"]] = _cp(fuzz.token_sort_ratio, c1, cx)
+        X[:, col["partial"]] = _cp(fuzz.partial_ratio, c1, cx)
+        X[:, col["ratio"]] = _cp(fuzz.ratio, c1, cx)
+        X[:, col["nospace"]] = _cp(fuzz.ratio, [s.replace(" ", "") for s in c1], [s.replace(" ", "") for s in cx])
+        X[:, col["jw"]] = process.cpdist(c1, cx, scorer=JaroWinkler.normalized_similarity, workers=-1,
+                                         dtype=np.float32)
+        alt = X[:, col["tset"]].copy()
+        altx = self.sx["alt_core"].gather(sxr).to_list()
+        for q in np.flatnonzero(np.fromiter((bool(a) for a in altx), dtype=bool, count=n)):
+            alt[q] = max(fuzz.token_set_ratio(c1[q], part) for part in altx[q].split("|")) / 100.0
+        X[:, col["alt_best"]] = alt
+        X[:, col["legal_code"]] = self.legal_M[self.legal1[s1r], self.legalx[sxr]]
+        a1 = self.s1["addr_norm"].gather(s1r).to_list()
+        ax = self.sx["addr_norm"].gather(sxr).to_list()
+        X[:, col["addr_tset"]] = _cp(fuzz.token_set_ratio, a1, ax)
+        X[:, col["addr_ratio"]] = _cp(fuzz.ratio, a1, ax)
+        X[:, col["was_indic"]:col["is_s3"] + 1] = self.flags_x[sxr]
+        return X
