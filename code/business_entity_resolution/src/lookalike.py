@@ -83,6 +83,27 @@ def legal_dropped(s1_legal, sx_legal, s1r, sxr):
     return ~e1[s1r] & ex[sxr]
 
 
+BOOST_WORDS = ("groupe", "developpement", "france")
+BOOST_P = 0.95
+BOOST_COLS = ["xw_n_extra", "mw_n_miss", "addr_tset", "num_primary_eq", "addr_empty_x"]
+
+
+def word_boost(tok, vocab, s1r, sxr, cols, unseen):
+    """Pairs to raise to p >= BOOST_P: in a country unseen in training, the SX's ONLY extra name word is a
+    dual-role word (fake descriptor at shifted numbers, true-copy noise at the exact address: 'groupe',
+    'developpement', 'france'), at most one S1 word is missing, and the address is the same with the same house
+    number. The word log-odds carried from English ('group' is always fake in train) push these true copies to
+    p ~0.1; at the exact address they occur like the true-noise words fils/cie/services (~10k France pairs)."""
+    pos = {t: i for i, t in enumerate(vocab)}
+    ids = [pos.get(w, -1) for w in BOOST_WORDS]
+    fx = _token_flags(tok["nsx_ptr"], tok["nsx_ids"], ids)
+    f1 = _token_flags(tok["ns1_ptr"], tok["ns1_ids"], ids)
+    added = (fx[sxr] & ~f1[s1r]).any(axis=1)
+    c = {k: np.asarray(v, dtype=np.float32) for k, v in cols.items()}
+    return (unseen & added & (c["xw_n_extra"] == 1) & (c["mw_n_miss"] <= 1) & (c["addr_tset"] >= 0.999)
+            & (c["num_primary_eq"] > 0.5) & (c["addr_empty_x"] < 0.5))
+
+
 def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None, strict=None):
     """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words;
     ldrop: pair flag from legal_dropped; unseen: pair flag 'S1 country not in the training data' (RF only);

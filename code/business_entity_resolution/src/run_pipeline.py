@@ -524,6 +524,38 @@ def stage_stage2(args):
     _validate_probs(p2, "decision_s2.json")
 
 
+def stage_stage2_final(args):
+    """Final models: the stage-2 fold judges and the stage-2 judge retrained on J + V together (66% more data;
+    halving J cost 0.00074 on V, so more data helps) with fixed round counts, since no data is left to early-stop
+    on. decision_s2.json from the validated run is kept. Overwrites judge_f0/judge_f1/judge_s2."""
+    import xgboost as xgb
+
+    from . import judge
+    from .context import stage2_features
+    tok = _load_tok("train")
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
+    X = np.concatenate([np.load(work("feat", "train_J.npy")), np.load(work("feat", "train_V.npy"))]).astype(np.float32)
+    s1 = np.r_[pj["s1"].to_numpy(), pv["s1"].to_numpy()]
+    sx = np.r_[pj["sx"].to_numpy(), pv["sx"].to_numpy()]
+    y = np.r_[pj["label"].to_numpy(), pv["label"].to_numpy()].astype(np.float32)
+    del pj, pv
+    fold = s1 % 2
+    p1 = np.empty(len(y), dtype=np.float32)
+    for f in (0, 1):
+        idx = np.flatnonzero(fold == f)
+        m = xgb.train(judge.PARAMS, xgb.QuantileDMatrix(X[idx], y[idx]), args.rounds_s1)
+        m.save_model(work("models", f"judge_f{f}.json"))
+        p1[fold != f] = judge.predict(m, X[fold != f])
+        log(f"final stage-1 fold {f}: {args.rounds_s1} rounds on {len(idx)} pairs")
+        del m
+        gc.collect()
+    S2 = stage2_features(tok, s1, sx, p1)
+    m2 = xgb.train(judge.PARAMS, xgb.QuantileDMatrix(np.hstack([X, S2]), y), args.rounds_s2)
+    m2.save_model(work("models", "judge_s2.json"))
+    log(f"final stage-2: {args.rounds_s2} rounds on {len(y)} pairs")
+
+
 def stage_predict_stage2(args):
     """Test predictions with the stage-2 judge from saved test features (written by predict-test)."""
     import json
@@ -633,7 +665,22 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
     return post
 
 
-def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s3=None):
+def _word_boost(split, s1r, sxr, X):
+    """lookalike.word_boost for these pairs (countries unseen in training only)."""
+    from .features import FEATURES
+    from .lookalike import BOOST_COLS, word_boost
+    names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
+    M = np.asarray(X[:, [names.index(c) for c in BOOST_COLS]], dtype=np.float32)
+    cols = {c: M[:, i] for i, c in enumerate(BOOST_COLS)}
+    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    unseen = ~np.isin(load_prep(split, "s1", ["country"])["country"].to_numpy()[s1r], sorted(seen))
+    with np.load(work("tok", f"{split}.npz")) as z:
+        tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
+    vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
+    return word_boost(tok, vocab, s1r, sxr, cols, unseen)
+
+
+def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s3=None, boost=None):
     """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
     overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array).
     decision["country_shift"] (optional, any rule) adds a logit shift to the named countries' p first.
@@ -641,6 +688,10 @@ def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s
     post (optional f(p, keep) -> bool per pair): pairs dropped after assignment, before the cut.
     is_s3 (optional bool per pair): enables the per-source caps after the cut."""
     from .decide import assign_best, expected_f05_cut, threshold_cut
+    if boost is not None:
+        from .lookalike import BOOST_P
+        p = np.where(boost, np.maximum(np.asarray(p, dtype=np.float32), np.float32(BOOST_P)), p)
+        log(f"boosted {int(boost.sum())} pairs by rule")
     if reject is not None:
         p = np.where(reject, np.float32(0), np.asarray(p, dtype=np.float32))
         log(f"rejected {int(reject.sum())} pairs by rule")
@@ -782,21 +833,23 @@ def stage_rethreshold(args):
     scored = pl.read_parquet(work("pred", "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
     s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
     del scored
-    reject, post, is_s3 = None, None, None
-    if args.shift_rule or args.lookalike or args.caps:  # test.npy rows are aligned with the scored pairs
+    reject, post, is_s3, boost = None, None, None, None
+    if args.shift_rule or args.lookalike or args.caps or args.word_boost:  # test.npy rows are aligned with pairs
         X = np.load(work("feat", "test.npy"), mmap_mode="r")
         assert X.shape[0] == len(p), "feat/test.npy is not from the run that scored these pairs"
         if args.shift_rule:
             reject = shift_rule_mask(X)
         if args.lookalike:
             post = _lookalike_post("test", s1r, sxr, X, args.rules.split(",") if args.rules else None)
+        if args.word_boost:
+            boost = _word_boost("test", s1r, sxr, X)
         if args.caps:
             from .features import FEATURES
             names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
             is_s3 = np.asarray(X[:, names.index("is_s3")]) > 0.5
         del X
     mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject, post=post,
-                   is_s3=is_s3)
+                   is_s3=is_s3, boost=boost)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -807,6 +860,7 @@ def stage_rethreshold(args):
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
           "candidates": stage_candidates, "address-pass": stage_address_pass, "tokens": stage_tokens,
           "vocab": stage_vocab, "stage2": stage_stage2, "predict-stage2": stage_predict_stage2,
+          "stage2-final": stage_stage2_final,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -830,6 +884,10 @@ def main():
     ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
     ap.add_argument("--caps", action="store_true", help="rethreshold: at most 5 S2 and 6 S3 matches per S1")
     ap.add_argument("--rules", default="", help="lookalike rules to apply (default src/lookalike.RULES)")
+    ap.add_argument("--word-boost", action="store_true",
+                    help="rethreshold: raise exact-address dual-role word copies in unseen countries (lookalike.word_boost)")
+    ap.add_argument("--rounds-s1", type=int, default=640, help="stage2-final: rounds of each stage-1 fold judge")
+    ap.add_argument("--rounds-s2", type=int, default=640, help="stage2-final: rounds of the stage-2 judge")
     ap.add_argument("--drop-frac", type=float, default=0.0,
                     help="features: simulate this share of S1s missing (as in test) for training and V")
     args = ap.parse_args()

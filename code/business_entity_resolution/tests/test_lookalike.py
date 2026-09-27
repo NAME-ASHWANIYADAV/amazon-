@@ -70,3 +70,18 @@ def test_legal_swapped_and_rl_only_for_strict_countries():
     for strict, want in ((False, [False, False]), (True, [False, True])):
         _, m = lookalike_reject(s1r, p, np.ones(2, bool), cols, xleg, np.zeros(2, bool), strict=np.full(2, strict))
         assert m["RL"].tolist() == want
+
+
+def test_word_boost_only_exact_address_single_extra_word_unseen_country():
+    from src.lookalike import word_boost
+    # S1 0 tokens {0}, S1 1 tokens {0, 1(groupe)}; SX 0 {0, 1}, SX 1 {0, 1}, SX 2 {0, 2(fils)}
+    tok = {"ns1_ptr": np.array([0, 1, 3]), "ns1_ids": np.array([0, 0, 1]),
+           "nsx_ptr": np.array([0, 2, 4, 6]), "nsx_ids": np.array([0, 1, 0, 1, 0, 2])}
+    vocab = ["ecole", "groupe", "fils"]
+    s1r, sxr = np.array([0, 0, 1, 0]), np.array([0, 1, 0, 2])
+    cols = {"xw_n_extra": np.array([1, 1, 0, 1]), "mw_n_miss": np.array([0, 0, 0, 0]),
+            "addr_tset": np.array([1.0, 0.5, 1.0, 1.0]), "num_primary_eq": np.array([1, 1, 1, 1]),
+            "addr_empty_x": np.array([0, 0, 0, 0])}
+    got = word_boost(tok, vocab, s1r, sxr, cols, np.ones(4, bool))
+    assert got.tolist() == [True, False, False, False]   # other address / word already in S1 / not a boost word
+    assert not word_boost(tok, vocab, s1r, sxr, cols, np.zeros(4, bool)).any()
