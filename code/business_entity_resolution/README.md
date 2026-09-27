@@ -48,13 +48,18 @@ python -m src.run_pipeline train-judge                      # stage-1 XGBoost on
 python -m src.run_pipeline validate                         # macro F0.5 on V, chooses the decision rule
 python -m src.run_pipeline stage2                           # stage-2 judge (within-list stage-1 context)
 python -m src.run_pipeline predict-test                     # stage-1 test probabilities + features
-python -m src.run_pipeline predict-stage2                   # stage-2 test probabilities
-python -m src.run_pipeline stage3-features --split train    # generator-structure features on V
+python -m src.run_pipeline stage3-features --split J        # generator-structure features (out-of-fold stage-1 view)
+python -m src.run_pipeline stage3-features --split V1
+python -m src.run_pipeline stage2-plus                      # stage-2 judge with those features (V +0.0013)
+python -m src.run_pipeline predict-stage2-plus              # its test probabilities (becomes the pipeline's stage 2)
+python -m src.run_pipeline stage3-features --split train    # generator-structure features on V (stage-2 view)
 python -m src.run_pipeline stage3-train                     # stage-3 recalibrator (LightGBM on V)
 python -m src.run_pipeline stage3-features --split test
 python -m src.run_pipeline stage3-predict                   # stage-3 test probabilities (guarded)
-python -m src.run_pipeline rethreshold --stage3 --rule expected_f --shift-rule --lookalike --caps --word-boost --style-add
+python -m src.run_pipeline rethreshold --stage3 --rule expected_f --shift-rule --lookalike --caps --word-boost --style-add --block-add
 ```
+
+(`predict-stage2` is the plain stage-2 judge without the generator-structure features, kept for comparison.)
 
 The last command writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` (the stage-A survivors
 that the judges score) and runs the organiser's validator. `rethreshold` re-decides saved probabilities without
@@ -69,6 +74,7 @@ recomputing features; its flags:
 | `--caps` | at most 5 S2 and 6 S3 matches per S1 (train truth maximum) |
 | `--word-boost` | in unseen countries, raise exact-address copies whose only extra word is a dual-role word (groupe / developpement / france) |
 | `--style-add` | in unseen countries, add unmatched same-number copies whose raw address style (number format, region rendering) agrees with the S1's confident same-source copies (`src/style.py`) |
+| `--block-add` | in unseen countries, append same-name / acronym copies at the same house number that the kNN blocking missed (strict street match, unique S1) |
 | `--country-thr`, `--country-shift` | per-country threshold / logit shift (not used in the final run) |
 
 ## Source map
