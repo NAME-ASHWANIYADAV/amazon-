@@ -55,7 +55,9 @@ python -m src.run_pipeline stage3-features --split V1
 python -m src.run_pipeline stage2-plus                      # stage-2 judge with those features (V +0.0013)
 python -m src.run_pipeline predict-stage2-plus              # its test probabilities (becomes the pipeline's stage 2)
 python -m src.run_pipeline ce-train --epochs 1 --ce-pairs 120000   # multilingual MiniLM cross-encoder on the J grey zone (GPU, ~1 h)
-python -m src.run_pipeline ce-apply                         # re-scores the test grey zone and blends it into stage 2 (V +0.0010)
+python -m src.run_pipeline ce-apply --ce-budget 9000       # re-scores the test grey zone, pairs nearest the decision boundary first,
+                                                            # for at most 9000 s, and blends the scored pairs into stage 2 (V +0.0010 when
+                                                            # everything is scored; ~90% of that gain sits within |logit| <= 3, 1.07M pairs)
 python -m src.run_pipeline stage3-features --split train    # generator-structure features on V (stage-2 view)
 python -m src.run_pipeline stage3-train                     # stage-3 recalibrator (LightGBM on V)
 python -m src.run_pipeline stage3-features --split test

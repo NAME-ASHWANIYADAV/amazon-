@@ -66,11 +66,17 @@ def finetune(tok, model, a, b, y, epochs=1, batch=64, lr=4e-5, log=print, seed=0
 
 
 @torch.inference_mode()
-def score(tok, model, a, b, batch=512, device="cuda", tok_chunk=8192, log=None):
-    """Logits for all pairs: tokenisation in large chunks (the fast tokenizer is the bottleneck), GPU batches."""
-    out = np.empty(len(a), dtype=np.float32)
+def score(tok, model, a, b, batch=512, device="cuda", tok_chunk=8192, log=None, budget=None):
+    """Logits for the pairs in order (NaN for pairs not reached within `budget` seconds): tokenisation in large
+    chunks, GPU batches. Callers put the pairs closest to the decision boundary first."""
+    out = np.full(len(a), np.nan, dtype=np.float32)
     model.eval()
+    t0 = time.time()
     for s in range(0, len(a), tok_chunk):
+        if budget is not None and time.time() - t0 > budget:
+            if log:
+                log(f"  ce budget reached after {s}/{len(a)} pairs")
+            break
         e = min(len(a), s + tok_chunk)
         enc = tok(a[s:e], b[s:e], truncation=True, max_length=MAX_LEN, padding=True, return_tensors="pt")
         for q in range(s, e, batch):

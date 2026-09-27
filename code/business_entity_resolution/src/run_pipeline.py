@@ -816,10 +816,14 @@ def stage_ce_apply(args):
     pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
     p = pr["p"].to_numpy().astype(np.float32)
     ti = np.flatnonzero((p > cfg["grey"][0]) & (p < cfg["grey"][1]))
-    log(f"cross-encoder: test grey zone {len(ti)} of {len(p)} pairs")
+    ti = ti[np.argsort(np.abs(np.log(p[ti] / (1 - p[ti]))), kind="stable")]   # closest to the boundary first
+    log(f"cross-encoder: test grey zone {len(ti)} of {len(p)} pairs, budget {args.ce_budget}s")
     a, b = _ce_texts("test", pr["s1"].to_numpy()[ti], pr["sx"].to_numpy()[ti])
     tok, model = load(work("models", "ce_pt"))
-    ce = score(tok, model, a, b, log=log)
+    ce = score(tok, model, a, b, log=log, budget=args.ce_budget)
+    done = ~np.isnan(ce)
+    ti, ce = ti[done], ce[done]
+    log(f"cross-encoder scored {len(ti)} pairs (|logit| up to {np.abs(np.log(p[ti] / (1 - p[ti]))).max():.2f})")
     np.save(work("pred", "ce_test_logit.npy"), np.c_[ti, ce])
     p_new = p.copy()
     p_new[ti] = blend(p[ti], ce, cfg["w"])
@@ -1332,6 +1336,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=3, help="predict-unseen: pseudo word log-odds rounds")
     ap.add_argument("--seeds", type=int, default=3, help="stage2-plus-seeds: number of seeds including seed 0")
     ap.add_argument("--ce-pairs", type=int, default=120_000, help="ce-train: J grey-zone pairs to fine-tune on")
+    ap.add_argument("--ce-budget", type=float, default=None,
+                    help="ce-apply: seconds of scoring (pairs nearest the decision boundary first); default all")
     ap.add_argument("--ce-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
                     help="ce-train: pretrained cross-encoder (Hugging Face id or local folder)")
     ap.add_argument("--self-train", action="store_true", help="predict-unseen: cross-fitted self-trained stage-1 judges")
