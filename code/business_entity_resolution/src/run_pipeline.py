@@ -556,6 +556,77 @@ def stage_stage2_final(args):
     log(f"final stage-2: {args.rounds_s2} rounds on {len(y)} pairs")
 
 
+def stage_predict_unseen(args):
+    """Re-score the pairs of countries absent from training with pseudo word log-odds (--rounds) and, with
+    --self-train, cross-fitted self-trained stage-1 judges; then stage 2 for those rows. Rewrites their rows
+    of pred/test_pairs_p2.parquet (seen countries unchanged). Run stage3-predict afterwards."""
+    import xgboost as xgb
+
+    from . import judge
+    from .context import stage2_features
+    from .unseen import LO_COLS, pseudo_lo_rounds, self_train, train_counts_in_test_vocab
+    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    country = load_prep("test", "s1", ["country"])["country"].to_numpy()
+    pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
+    s1_all, sx_all = pr["s1"].to_numpy(), pr["sx"].to_numpy()
+    rows = np.flatnonzero(~np.isin(country[s1_all], sorted(seen)))
+    if len(rows) == 0:
+        log("no unseen country in the test data; nothing to do")
+        return
+    log(f"unseen-country pairs: {len(rows)} ({', '.join(sorted(set(country[s1_all[rows]].tolist())))})")
+    s1, sx = s1_all[rows].astype(np.int64), sx_all[rows].astype(np.int64)
+    # training-truth word counts in the test vocabulary
+    with np.load(work("tok", "train.npz")) as z:
+        tok_tr = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
+    vtr = pl.read_parquet(work("tok", "train_vocab_n.parquet"))["token"].to_list()
+    vte = pl.read_parquet(work("tok", "test_vocab_n.parquet"))["token"].to_list()
+    cnt_base, tot_base = train_counts_in_test_vocab(tok_tr, pj["s1"].to_numpy(), pj["sx"].to_numpy(),
+                                                    pj["label"].to_numpy(), vtr, vte)
+    del tok_tr, vtr, vte
+    tok = _load_tok("test")
+    XT = np.load(work("feat", "test.npy"), mmap_mode="r")
+    X = np.empty((len(rows), XT.shape[1]), dtype=np.float32)
+    for b in range(0, len(rows), 500_000):
+        r = rows[b:b + 500_000]
+        X[b:b + len(r)] = np.asarray(XT[r[0]:r[-1] + 1], dtype=np.float32)[r - r[0]]
+    del XT
+    gc.collect()
+    models = [xgb.Booster(model_file=work("models", f"judge_f{f}.json")) for f in (0, 1)]
+    p1 = pseudo_lo_rounds(tok, s1, sx, X, models, cnt_base, tot_base, rounds=args.rounds, log=log)
+    del models, cnt_base
+    if args.self_train:
+        XJ = np.load(work("feat", "train_J.npy")).astype(np.float32)
+        yj = pj["label"].to_numpy().astype(np.float32)
+        n_eval = int((pj["s1"] % 10 == 0).sum())
+        p1 = self_train(XJ, yj, n_eval, s1, sx, X, p1, log=log)
+        del XJ, yj
+        gc.collect()
+    del pj
+    S2 = stage2_features(tok, s1, sx, p1)
+    m2 = xgb.Booster(model_file=work("models", "judge_s2.json"))
+    p2 = judge.predict(m2, np.hstack([X, S2]))
+    old = pr["p"].to_numpy().astype(np.float32)
+    new = old.copy()
+    new[rows] = p2
+    pr.with_columns(pl.Series("p", new)).write_parquet(work("pred", "test_pairs_p2.parquet"))
+    # the judged log-odds columns of these rows changed: keep the feature file consistent for the rules/stage 3
+    XT = np.load(work("feat", "test.npy"), mmap_mode="r+")
+    backup = work("feat", "unseen_lo_backup.npz")
+    if not os.path.exists(backup):   # original log-odds columns of these rows (restore by hand if ever needed)
+        np.savez(backup, rows=rows, lo=np.asarray(XT[rows][:, LO_COLS]))
+    for b in range(0, len(rows), 500_000):
+        r = rows[b:b + 500_000]
+        blk = np.asarray(XT[r[0]:r[-1] + 1])
+        for j, c in enumerate(LO_COLS):
+            blk[r - r[0], c] = X[b:b + len(r), c]
+        XT[r[0]:r[-1] + 1] = blk
+    XT.flush()
+    del XT
+    log(f"unseen rows rescored: mean p2 {old[rows].mean():.4f} -> {p2.mean():.4f}; "
+        f"|change| > 0.5 for {int((np.abs(p2 - old[rows]) > 0.5).sum())} pairs")
+
+
 def stage_stage3_features(args):
     """Stage-3 generator-structure features for V (--split train) or test, from the stage-2 probabilities."""
     from .stage3 import split_features
@@ -967,6 +1038,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
           "vocab": stage_vocab, "stage2": stage_stage2, "predict-stage2": stage_predict_stage2,
           "stage2-final": stage_stage2_final, "stage3-features": stage_stage3_features,
           "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
+          "predict-unseen": stage_predict_unseen,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -995,6 +1067,8 @@ def main():
                     help="rethreshold: add unmatched same-number copies in unseen countries whose address style matches the S1's copies")
     ap.add_argument("--word-boost", action="store_true",
                     help="rethreshold: raise exact-address dual-role word copies in unseen countries (lookalike.word_boost)")
+    ap.add_argument("--rounds", type=int, default=3, help="predict-unseen: pseudo word log-odds rounds")
+    ap.add_argument("--self-train", action="store_true", help="predict-unseen: cross-fitted self-trained stage-1 judges")
     ap.add_argument("--rounds-s1", type=int, default=640, help="stage2-final: rounds of each stage-1 fold judge")
     ap.add_argument("--rounds-s2", type=int, default=640, help="stage2-final: rounds of the stage-2 judge")
     ap.add_argument("--drop-frac", type=float, default=0.0,
