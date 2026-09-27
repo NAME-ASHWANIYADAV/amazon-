@@ -114,7 +114,7 @@ def test_core_hash_order_free_and_empty():
     assert h[0] == h[1] != h[2] and h[3] == 0
 
 
-def test_global_counts_are_per_country_rates():
+def test_global_counts_are_per_country_counts():
     from src.context import CTX_COLS, context_features
     # two S1s share a core name, one in each country; one SX with that name in each country
     ns1_ptr, ns1_ids = _csr([[0], [0]], np.int32)
@@ -128,9 +128,9 @@ def test_global_counts_are_per_country_rates():
     f = context_features(tok, np.array([0, 1]), np.array([0, 1]), np.ones(2, np.float32), np.ones(2, np.float32),
                          lo, lo)
     col = {c: i for i, c in enumerate(CTX_COLS)}
-    # each country has 1 S1 and 1 SX: 1 S1 of 1 -> 1e5 per 100k, 1 SX of 1 -> 1e6 per 1M; no cross-country count
-    assert f[:, col["g_n_s1_core"]].tolist() == [1e5, 1e5]
-    assert f[:, col["g_n_sx_core"]].tolist() == [1e6, 1e6]
+    # each country has 1 S1 and 1 SX with the name: raw counts, never across countries
+    assert f[:, col["g_n_s1_core"]].tolist() == [1, 1]
+    assert f[:, col["g_n_sx_core"]].tolist() == [1, 1]
 
 
 def test_country_idf_rows():

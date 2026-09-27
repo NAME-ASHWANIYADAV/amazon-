@@ -627,12 +627,74 @@ def stage_predict_unseen(args):
         f"|change| > 0.5 for {int((np.abs(p2 - old[rows]) > 0.5).sum())} pairs")
 
 
+def stage_stage2_plus(args):
+    """Stage-2 judge trained on J with the stage-3 generator-structure features appended (from the out-of-fold
+    stage-1 view: feat/stage3_J.parquet, feat/stage3_V1.parquet). Validates on V and saves models/judge_s2plus.json."""
+    from . import judge
+    from .context import stage2_features
+    from .stage3 import NEW_F
+    tok = _load_tok("train")
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
+    p1j = np.load(work("pred", "train_J_p1oof.npy"))
+    p1v = np.load(work("pred", "train_V_p1avg.npy"))
+    fj = pl.read_parquet(work("feat", "stage3_J.parquet")).sort("i")
+    fv = pl.read_parquet(work("feat", "stage3_V1.parquet")).sort("i")
+    assert fj.height == pj.height and fv.height == pv.height
+    S2j = stage2_features(tok, pj["s1"].to_numpy(), pj["sx"].to_numpy(), p1j)
+    S2v = stage2_features(tok, pv["s1"].to_numpy(), pv["sx"].to_numpy(), p1v)
+    G = lambda f: np.column_stack([f[c].to_numpy().astype(np.float32) for c in NEW_F])
+    XJ = np.hstack([np.load(work("feat", "train_J.npy")).astype(np.float32), S2j, G(fj)])
+    XV = np.hstack([np.load(work("feat", "train_V.npy")).astype(np.float32), S2v, G(fv)])
+    del S2j, S2v, fj, fv
+    gc.collect()
+    yj = pj["label"].to_numpy().astype(np.float32)
+    m2 = judge.train(XJ, yj, int((pj["s1"] % 10 == 0).sum()))
+    m2.save_model(work("models", "judge_s2plus.json"))
+    log("stage-2+ best iteration", m2.best_iteration)
+    p2 = judge.predict(m2, XV)
+    np.save(work("pred", "train_V_p2plus.npy"), p2)
+    log("stage-2+ on V:")
+    _validate_probs(p2, "decision_s2plus.json")
+
+
 def stage_stage3_features(args):
     """Stage-3 generator-structure features for V (--split train) or test, from the stage-2 probabilities."""
     from .stage3 import split_features
     if args.split == "train":
         pr = pl.read_parquet(work("feat", "train_V_pairs.parquet"), columns=["s1", "sx"])
         p, prep, out = np.load(work("pred", "train_V_p2.npy")).astype(np.float32), "train", work("feat", "stage3_V.parquet")
+    elif args.split == "V1":  # V from the fold-mean stage-1 probabilities (matches the J out-of-fold view)
+        import xgboost as xgb
+
+        from . import judge
+        pr = pl.read_parquet(work("feat", "train_V_pairs.parquet"), columns=["s1", "sx"])
+        XV = np.load(work("feat", "train_V.npy"), mmap_mode="r")
+        p = np.mean([judge.predict(xgb.Booster(model_file=work("models", f"judge_f{f}.json")), XV) for f in (0, 1)],
+                    axis=0).astype(np.float32)
+        del XV
+        np.save(work("pred", "train_V_p1avg.npy"), p)
+        prep, out = "train", work("feat", "stage3_V1.parquet")
+    elif args.split == "J":   # from the out-of-fold stage-1 probabilities (fold judge f scores the other fold)
+        import xgboost as xgb
+
+        from . import judge
+        pr = pl.read_parquet(work("feat", "train_J_pairs.parquet"), columns=["s1", "sx"])
+        XJ = np.load(work("feat", "train_J.npy"), mmap_mode="r")
+        fold = pr["s1"].to_numpy() % 2
+        p = np.empty(pr.height, dtype=np.float32)
+        for f in (0, 1):
+            rows = np.flatnonzero(fold != f)
+            p[rows] = judge.predict(xgb.Booster(model_file=work("models", f"judge_f{f}.json")), XJ[rows])
+        del XJ
+        np.save(work("pred", "train_J_p1oof.npy"), p)
+        prep, out = "train", work("feat", "stage3_J.parquet")
+        order = np.argsort(pr["s1"].to_numpy(), kind="stable")   # J rows are not grouped by s1
+        split_features(prep, pr["s1"].to_numpy()[order], pr["sx"].to_numpy()[order], p[order], out, log=log)
+        f = pl.read_parquet(out).sort("i")
+        f.with_columns(pl.Series("i", order[f["i"].to_numpy()])).sort("i").write_parquet(out)
+        log("stage-3 features", out)
+        return
     else:
         pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
         p, prep, out = pr["p"].to_numpy().astype(np.float32), "test", work("feat", "stage3_test.parquet")
@@ -1039,6 +1101,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
           "stage2-final": stage_stage2_final, "stage3-features": stage_stage3_features,
           "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
           "predict-unseen": stage_predict_unseen,
+          "stage2-plus": stage_stage2_plus,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -1046,7 +1109,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=sorted(STAGES))
-    ap.add_argument("--split", default="train", choices=["train", "test"])
+    ap.add_argument("--split", default="train", choices=["train", "test", "J", "V1"])
     ap.add_argument("--floor", type=float, default=None)
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--k-addr", type=int, default=0, help="extra neighbours by address cosine (candidates)")

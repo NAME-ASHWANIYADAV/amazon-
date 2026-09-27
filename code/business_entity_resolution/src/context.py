@@ -332,16 +332,9 @@ def context_features(tok, s1r, sxr, cos_name, cos_addr, lo_extra, lo_miss, s1_pr
     n_sx = counts(sx_key, hx)
     n_emp = counts(sx_key, hx[empty])
     out[:, col["g_emp_ratio"]] = n_emp / np.maximum(n_s1, 1)
-    if "cc_s1" in tok:
-        # counts as rates of the country's size (S1s per 100k present S1s, SX per 1M SX): raw counts scale with
-        # the split (test US has 0.62x the S1s of train US), which made test names look rare to the judge
-        pres = np.ones(len(h1), dtype=bool) if s1_present is None else s1_present
-        n1c = np.bincount(tok["cc_s1"][pres], minlength=4).astype(np.float64)
-        nxc = np.bincount(tok["cc_sx"], minlength=4).astype(np.float64)
-        c = tok["cc_s1"][s1r64]
-        n_s1 = n_s1 * (1e5 / np.maximum(n1c, 1))[c]
-        n_sx = n_sx * (1e6 / np.maximum(nxc, 1))[c]
-        n_emp = n_emp * (1e6 / np.maximum(nxc, 1))[c]
+    # raw counts (within the record's country): the judge reads them as "how many entities compete for this
+    # name". Turning them into rates of the country's size made every unique test name look like 2 (US) to 5
+    # (France) competitors and separated test from train perfectly (adversarial AUC 1.0).
     out[:, col["g_n_s1_core"]] = n_s1
     out[:, col["g_n_sx_core"]] = n_sx
     out[:, col["g_n_sxemp_core"]] = n_emp
