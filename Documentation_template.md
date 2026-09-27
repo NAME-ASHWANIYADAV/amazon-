@@ -14,10 +14,10 @@ vectors; GPU brute-force cosine search per country produces candidates (record p
 cheap stage-A filter prunes them to ~9 pairs per entity; a stacked XGBoost judge (stage 1, then stage 2 on
 within-list context) scores each pair from 71 features, including generator-aware ones (house-number shift
 alignment, sibling agreement, word log-odds, cross-entity competition); a stage-3 recalibrator adds
-generator-structure features (per-source address base, co-location, duplicates); and a decision layer enforces
+generator-structure features (per-source address base, co-location, duplicates, digit-level number edits); and a decision layer enforces
 "each Source-2/3 record belongs to at most one Source-1 entity", picks per entity the number of matches that
 maximises exact expected F0.5, and removes lookalike fake groups with rules derived from the generator's
-regularities. Validation macro F0.5 (10% held-out entities): 0.9881. Public leaderboard: 0.975 (U2: see §5).
+regularities. Validation macro F0.5 (10% held-out entities): 0.9888. Public leaderboard: 0.978 (see §5).
 
 ---
 
@@ -74,8 +74,8 @@ Key findings from EDA (train: 2.21M S1, 10.3M S2+S3; test: 1.73M S1, 9.97M S2+S3
 
 ## 5. Results & Error Analysis
 
-- **Validation macro F0.5 (V, 221k entities):** stage 1 0.9863 → stage 2 0.9869 → stage 3 0.9881 (US 0.9890, India 0.9868). Pair precision 0.997, recall 0.968.
-- **Public leaderboard:** 0.963 (v1) → 0.971 (shift rule) → 0.975 (stage 2 + lookalike rules) → [final].
+- **Validation macro F0.5 (V, 221k entities):** stage 1 0.9862 → stage 2 0.9870 → stage 2+ (generator-structure features inside the judge) 0.9883 → stage-3 recalibrator 0.9888 (US 0.9896, India 0.9877). Pair precision 0.998, recall 0.969.
+- **Public leaderboard:** 0.963 (v1) → 0.971 (shift rule) → 0.975 (stage 2 + lookalike rules) → 0.977 (stage 3, France fixes) → 0.978 (stage 2+, raw name counts, France additions) → [final].
 - **Common false positives (test):** lookalike fake groups at shifted house numbers with a legal-form change ('little diner inc / co / ltd | 4311' for 'little diner | 4310'); brand-only copies of a co-located entity. Test has ~2x the train distractor rate and fakes come in groups, which is the main validation-to-leaderboard gap; the rules and stage 3 recover about half of it.
 - **Common false negatives:** empty-address copies whose name is shared by several S1s (76% of them irreducible ties on the available data); French acronym and abbreviation copies.
 - **What did not help (measured on V):** a character-level cross-encoder blend (+0.00001), transitive rare-token links (0), count priors and joint assignment (< 0.0002), hyper-parameter sweeps (−0.001), training with simulated missing S1s (test has none: source-balance z-test).
