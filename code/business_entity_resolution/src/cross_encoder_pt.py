@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 
-MODEL_ID = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+MODEL_ID = r"C:\amazon_ml\work\models\mminilm"   # local copy of cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 (Apache-2.0)
 MAX_LEN = 96
 
 
