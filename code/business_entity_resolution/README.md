@@ -53,7 +53,7 @@ python -m src.run_pipeline stage3-features --split train    # generator-structur
 python -m src.run_pipeline stage3-train                     # stage-3 recalibrator (LightGBM on V)
 python -m src.run_pipeline stage3-features --split test
 python -m src.run_pipeline stage3-predict                   # stage-3 test probabilities (guarded)
-python -m src.run_pipeline rethreshold --stage3 --rule expected_f --shift-rule --lookalike --caps --word-boost
+python -m src.run_pipeline rethreshold --stage3 --rule expected_f --shift-rule --lookalike --caps --word-boost --style-add
 ```
 
 The last command writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` (the stage-A survivors
@@ -68,6 +68,7 @@ recomputing features; its flags:
 | `--lookalike` | drop lookalike fake groups after assignment (`src/lookalike.py`, rules R1/RM/RB/W/RF/RL by default; `--rules R1,RM,RB,W,RF,RL,RW` adds the common-word-swap rule for unseen countries) |
 | `--caps` | at most 5 S2 and 6 S3 matches per S1 (train truth maximum) |
 | `--word-boost` | in unseen countries, raise exact-address copies whose only extra word is a dual-role word (groupe / developpement / france) |
+| `--style-add` | in unseen countries, add unmatched same-number copies whose raw address style (number format, region rendering) agrees with the S1's confident same-source copies (`src/style.py`) |
 | `--country-thr`, `--country-shift` | per-country threshold / logit shift (not used in the final run) |
 
 ## Source map
@@ -84,6 +85,7 @@ recomputing features; its flags:
 | `src/stage3.py` | stage-3 recalibrator: per-source address base, co-location, duplicates, name-edit type (LightGBM on V) |
 | `src/decide.py` | assignment (each SX to one S1), exact expected-F0.5 cut, threshold rule |
 | `src/lookalike.py` | lookalike-group rules (same-source anchor conflict, mixed-source groups, all-modified groups, fake words, unseen-country rules), word boost |
+| `src/style.py` | address-rendering style from the raw text, name-edit categories, street mismatch, style-agreement additions |
 | `src/evaluate.py` | organizer macro F0.5 |
 | `src/io_utils.py` | TSV reading, streaming submission writer |
 | `src/run_pipeline.py` | CLI stages above |
