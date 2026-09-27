@@ -8,3 +8,9 @@
 Both files are stored with Git LFS: use the **Download** button on the file page (or `git lfs pull` after cloning). Do not open/re-save the TSV in Excel or a text editor before uploading — upload the downloaded file unchanged.
 
 Expected public-leaderboard macro F0.5: 0.979–0.981 (validation 0.9898). Write-up: `../Documentation_template.md`; code: `../code/business_entity_resolution/README.md`.
+
+## Probe uploads (27 Sep evening, after the organisers granted 2 extra submissions)
+
+| File | Change vs FINAL | Purpose |
+|---|---|---|
+| `PROBE_A_france_strict_matching_results.tsv` | France only: no style/blocking additions, France logit shift −0.8 (3.40 → 3.25 matches per France entity; US/India identical) | Measures France precision on the leaderboard: score up ⇒ France was over-predicting; score down ⇒ re-upload `FINAL_matching_results.tsv`. |
