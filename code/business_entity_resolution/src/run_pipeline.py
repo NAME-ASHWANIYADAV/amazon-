@@ -1088,6 +1088,28 @@ def stage_rethreshold(args):
         p = np.where(add, np.float32(0.95) + np.float32(0.05) * p, p)   # order among additions preserved
         mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject, post=post,
                        is_s3=is_s3, boost=boost)
+    if args.block_add:   # copies outside the candidate lists (unseen countries): appended as extra pairs
+        from .style import blocking_additions, common_tokens
+        seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+        s1p = load_prep("test", "s1", ["country", "name_core", "addr_norm"])
+        unseen_c = sorted(set(s1p["country"].unique().to_list()) - seen)
+        extra1, extrax = np.zeros(0, np.int64), np.zeros(0, np.int64)
+        if unseen_c:
+            sxp = load_prep("test", "sx", ["country", "name_core", "addr_norm"])
+            matched = np.zeros(sxp.height, dtype=bool)
+            matched[np.unique(sxr[mask])] = True
+            u1 = np.flatnonzero(s1p["country"].is_in(unseen_c).to_numpy())
+            ux = np.flatnonzero(sxp["country"].is_in(unseen_c).to_numpy() & ~matched)
+            common = common_tokens(s1p["addr_norm"].gather(u1).to_list())
+            extra1, extrax = blocking_additions(s1p["name_core"].gather(u1).to_list(), s1p["addr_norm"].gather(u1).to_list(), u1,
+                                                sxp["name_core"].gather(ux).to_list(), sxp["addr_norm"].gather(ux).to_list(), ux, common)
+            del sxp
+        log(f"blocking additions (unseen countries): {len(extra1)} pairs")
+        if len(extra1):
+            s1r = np.r_[s1r, extra1.astype(s1r.dtype)]
+            sxr = np.r_[sxr, extrax.astype(sxr.dtype)]
+            p = np.r_[p, np.full(len(extra1), 0.96, dtype=np.float32)]
+            mask = np.r_[mask, np.ones(len(extra1), dtype=bool)]
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -1126,6 +1148,8 @@ def main():
     ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
     ap.add_argument("--caps", action="store_true", help="rethreshold: at most 5 S2 and 6 S3 matches per S1")
     ap.add_argument("--rules", default="", help="lookalike rules to apply (default src/lookalike.RULES)")
+    ap.add_argument("--block-add", action="store_true",
+                    help="rethreshold: append same-name/acronym + same-number copies that blocking missed (unseen countries)")
     ap.add_argument("--style-add", action="store_true",
                     help="rethreshold: add unmatched same-number copies in unseen countries whose address style matches the S1's copies")
     ap.add_argument("--word-boost", action="store_true",

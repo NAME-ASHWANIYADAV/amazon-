@@ -45,3 +45,14 @@ def test_style_additions_needs_agreeing_anchor():
     smis = np.zeros(4, np.int8)
     got = style_additions(s1r, sxr, p, keep, pred, cand, nf, reg, src, ncat, smis)
     assert got.tolist() == [False, False, True, False]
+
+
+def test_blocking_additions_exact_and_acronym_unique_only():
+    from src.style import blocking_additions
+    common = {"rue", "de", "la"}
+    s1_core = ["ecole maternelle louise", "comite du team", "comite du team"]
+    s1_addr = ["20 rue chevire nantes", "53 rue princesse lille", "53 rue princesse paris"]
+    sx_core = ["ecole maternelle louise", "cdt", "ecole maternelle louise"]
+    sx_addr = ["20 rue chevirre nantes", "53 rue princesse lille", "21 rue chevire nantes"]
+    a, b = blocking_additions(s1_core, s1_addr, np.array([0, 1, 2]), sx_core, sx_addr, np.array([10, 11, 12]), common)
+    assert a.tolist() == [0] and b.tolist() == [10]   # acronym 'cdt' ambiguous (2 S1s at number 53); 21 != 20

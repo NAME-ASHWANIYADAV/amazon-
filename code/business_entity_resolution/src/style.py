@@ -146,3 +146,52 @@ def style_additions(s1r, sxr, p, keep, pred, cand, nf, reg, src, ncat, smis, p_m
     out = np.zeros(n, dtype=bool)
     out[d["i"].to_numpy()] = True
     return out
+
+
+def blocking_additions(s1_core, s1_addr, s1_rows, sx_core, sx_addr, sx_rows, common):
+    """Copies the kNN blocking missed, for an unseen country: an unmatched SX whose name core equals the S1's
+    (or is its initials, 2-4 letters, S1 core of 2+ words) with the same first house number, a strict street
+    match (every rare S1 street token of 4+ letters found in the SX address, up to one miss) and exactly one
+    such S1. Returns (s1_row, sx_row) arrays."""
+    def first_num(a):
+        for t in (a or "").split():
+            if t.isdigit():
+                return t
+        return ""
+
+    def initials(core):
+        t = core.split()
+        return "".join(w[0] for w in t) if len(t) >= 2 else ""
+
+    by_key = {}
+    for r, core, addr in zip(s1_rows, s1_core, s1_addr):
+        n = first_num(addr)
+        if not n or not core:
+            continue
+        by_key.setdefault((core, n), []).append(r)
+        ini = initials(core)
+        if 2 <= len(ini) <= 4:
+            by_key.setdefault((ini, n), []).append(r)
+    s1_addr_of = dict(zip(s1_rows, s1_addr))
+
+    def strict(a, b):
+        r1 = [t for t in (a or "").split() if not t.isdigit() and t not in common and len(t) >= 4]
+        if not r1:
+            return False
+        tb = set((b or "").split())
+        hit = sum(1 for t in r1 if t in tb or any(len(u) >= 4 and Levenshtein.distance(t, u, score_cutoff=1) <= 1 for u in tb))
+        return hit >= max(1, len(r1) - 1)
+
+    out1, outx = [], []
+    for r, core, addr in zip(sx_rows, sx_core, sx_addr):
+        n = first_num(addr)
+        if not n or not core:
+            continue
+        cands = by_key.get((core, n))
+        if not cands or len(set(cands)) != 1:
+            continue
+        s = cands[0]
+        if strict(s1_addr_of[s], addr):
+            out1.append(s)
+            outx.append(r)
+    return np.array(out1, dtype=np.int64), np.array(outx, dtype=np.int64)
