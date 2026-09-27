@@ -148,11 +148,15 @@ def style_additions(s1r, sxr, p, keep, pred, cand, nf, reg, src, ncat, smis, p_m
     return out
 
 
+ADD_CATS = ("EQ", "PERM", "NOSP", "ACRO")
+
+
 def blocking_additions(s1_core, s1_addr, s1_rows, sx_core, sx_addr, sx_rows, common):
-    """Copies the kNN blocking missed, for an unseen country: an unmatched SX whose name core equals the S1's
-    (or is its initials, 2-4 letters, S1 core of 2+ words) with the same first house number, a strict street
-    match (every rare S1 street token of 4+ letters found in the SX address, up to one miss) and exactly one
-    such S1. Returns (s1_row, sx_row) arrays."""
+    """Copies the kNN blocking missed, for an unseen country: an unmatched SX joined to S1s on (first house
+    number, a rare street token of 4+ letters), whose name core is the S1's, a permutation of it, its
+    space-free form or its initials (ADD_CATS), with a strict street match (every rare S1 street token found in
+    the SX address, up to one miss) and exactly one such S1. Style agreement with the S1's confident copies:
+    0.97-0.995 (chance 0.03). Returns (s1_row, sx_row) arrays."""
     def first_num(a):
         for t in (a or "").split():
             if t.isdigit():
@@ -163,16 +167,18 @@ def blocking_additions(s1_core, s1_addr, s1_rows, sx_core, sx_addr, sx_rows, com
         t = core.split()
         return "".join(w[0] for w in t) if len(t) >= 2 else ""
 
+    def street_keys(addr):
+        return {t for t in (addr or "").split() if len(t) >= 4 and not t.isdigit() and t not in common}
+
     by_key = {}
+    s1_core_of, s1_addr_of = {}, {}
     for r, core, addr in zip(s1_rows, s1_core, s1_addr):
         n = first_num(addr)
         if not n or not core:
             continue
-        by_key.setdefault((core, n), []).append(r)
-        ini = initials(core)
-        if 2 <= len(ini) <= 4:
-            by_key.setdefault((ini, n), []).append(r)
-    s1_addr_of = dict(zip(s1_rows, s1_addr))
+        s1_core_of[r], s1_addr_of[r] = core, addr
+        for t in street_keys(addr):
+            by_key.setdefault((n, t), set()).add(r)
 
     def strict(a, b):
         r1 = [t for t in (a or "").split() if not t.isdigit() and t not in common and len(t) >= 4]
@@ -187,10 +193,13 @@ def blocking_additions(s1_core, s1_addr, s1_rows, sx_core, sx_addr, sx_rows, com
         n = first_num(addr)
         if not n or not core:
             continue
-        cands = by_key.get((core, n))
-        if not cands or len(set(cands)) != 1:
+        cands = set()
+        for t in street_keys(addr):
+            cands |= by_key.get((n, t), set())
+        close = [s for s in cands if name_category(s1_core_of[s], core) in ADD_CATS]
+        if len(close) != 1:
             continue
-        s = cands[0]
+        s = close[0]
         if strict(s1_addr_of[s], addr):
             out1.append(s)
             outx.append(r)
