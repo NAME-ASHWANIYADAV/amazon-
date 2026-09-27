@@ -21,6 +21,7 @@ from rapidfuzz.distance import Levenshtein
 
 DISTRACTOR_SET = [1, 2, 3, 4, 5, 7, 9, 11, 13, 21]
 FAKE_WORDS = ("holding", "holdings", "group", "groupe", "participations")
+STRONG_FAKE_WORDS = ("participations", "holding")   # ~0.2% at the exact address in unseen-country test data
 COUNTRY_WORD = {"France": "france", "India": "india"}
 NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3",
              "addr_empty_x"]
@@ -162,8 +163,17 @@ def word_boost(tok, vocab, s1r, sxr, cols, unseen):
             & (c["num_primary_eq"] > 0.5) & (c["addr_empty_x"] < 0.5))
 
 
+def strong_fake_words(tok, vocab, s1r, sxr):
+    """Pair flag: the SX name adds a word that marks a fake at any house number (STRONG_FAKE_WORDS)."""
+    pos = {t: i for i, t in enumerate(vocab)}
+    ids = [pos.get(w, -1) for w in STRONG_FAKE_WORDS]
+    fx = _token_flags(tok["nsx_ptr"], tok["nsx_ids"], ids)
+    f1 = _token_flags(tok["ns1_ptr"], tok["ns1_ids"], ids)
+    return (fx[sxr] & ~f1[s1r]).any(axis=1)
+
+
 def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None, strict=None,
-                     rw=None):
+                     rw=None, xstrong=None):
     """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words;
     ldrop: pair flag from legal_dropped; unseen: pair flag 'S1 country not in the training data' (RF only);
     strict: pair flag 'S1 country's train true copies swap legal forms under LEGAL_SWAP_STRICT' (RL only).
@@ -183,6 +193,7 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "unseen": np.zeros(n, dtype=bool) if unseen is None else unseen,
         "strict": np.zeros(n, dtype=bool) if strict is None else strict,
         "rw": np.zeros(n, dtype=bool) if rw is None else rw,
+        "xstrong": np.zeros(n, dtype=bool) if xstrong is None else xstrong,
     }).with_columns(pl.col("off").fill_nan(None))
     num = pl.col("off").is_not_null() & (pl.col("off") != 0)
     anc = (pl.col("keep") & (pl.col("p") >= tau) & (pl.col("off") == 0)).fill_null(False).cast(pl.Int32)
@@ -199,7 +210,8 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "RM": pl.col("ins") & pl.col("sim") & (pl.col("g2") >= 1) & (pl.col("g3") >= 1),
         "RB": pl.col("ins") & (pl.col("off") >= 3) & pl.col("mod") & (pl.col("sib1") == 0) & (pl.col("sibx") >= 1)
               & (pl.col("g_unmod") == 0),
-        "W": pl.col("xword") & (pl.col("off") >= 3),   # below 3 the mirror test says these include true typos
+        "W": (pl.col("xword") & (pl.col("off") >= 3))   # below 3 the mirror test says these include true typos
+             | (pl.col("xstrong") & pl.col("unseen")),
         "RF": pl.col("unseen") & off12 & (pl.col("sib1") >= 1) & (pl.col("xleg") | pl.col("ndiff")) & ~pl.col("ldrop"),
         "RL": pl.col("strict") & off12 & (pl.col("sib1") >= 1) & pl.col("xleg"),
         "RW": pl.col("rw"),

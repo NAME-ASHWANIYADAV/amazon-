@@ -199,8 +199,9 @@ def _logit(p):
     return np.log(p / (1 - p)).astype(np.float32)
 
 
-def matrix(X, feats, p, a, b):
-    """float32 (b-a, len(STAGE3_COLS)) for pair rows [a, b): logit(p2), XB columns of X, NEW_F from feats."""
+def matrix(X, feats, p, a, b, f0=0):
+    """float32 (b-a, len(STAGE3_COLS)) for pair rows [a, b): logit(p2), XB columns of X, NEW_F from feats
+    (feats arrays start at pair row f0)."""
     idx = [FEATURES.index(c) for c in XB]
     M = np.empty((b - a, len(STAGE3_COLS)), dtype=np.float32)
     M[:, 0] = _logit(p[a:b])
@@ -208,7 +209,7 @@ def matrix(X, feats, p, a, b):
         e = min(b, s + 200_000)
         M[s - a:e - a, 1:1 + len(XB)] = X[s:e][:, idx]
     for j, c in enumerate(NEW_F):
-        M[:, 1 + len(XB) + j] = feats[c][a:b]
+        M[:, 1 + len(XB) + j] = feats[c][a - f0:b - f0]
     return M
 
 
@@ -223,7 +224,7 @@ def predict(model, X, feats_path, p, chunk=1_000_000):
         f = pl.scan_parquet(feats_path).slice(a, b - a).collect()
         assert f["i"][0] == a and f.height == b - a
         feats = {c: f[c].to_numpy() for c in NEW_F}
-        out[a:b] = model.predict(matrix(X, feats, p, a, b))
+        out[a:b] = model.predict(matrix(X, feats, p, a, b, f0=a))
         del f, feats
     return out
 

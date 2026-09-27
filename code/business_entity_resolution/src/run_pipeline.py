@@ -699,6 +699,8 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
         tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
     vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
     xword = extra_words(tok, vocab, s1r, sxr, s1["country"].to_numpy()[s1r])
+    from .lookalike import strong_fake_words
+    xstrong = strong_fake_words(tok, vocab, s1r, sxr)
     rw = None
     if rules and "RW" in rules:
         from .lookalike import common_word_swap
@@ -709,7 +711,7 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
     def post(p, keep):
         kw = {"rules": tuple(rules)} if rules else {}
         rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen, strict=strict,
-                                      rw=rw, **kw)
+                                      rw=rw, xstrong=xstrong, **kw)
         log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
         return rej
     return post
@@ -864,6 +866,50 @@ def stage_predict_test(args):
     _run_validator()
 
 
+def _style_additions(s1r, sxr, p, X, mask0, keep):
+    """lookalike-independent additions for countries unseen in training (src/style.py); bool per pair."""
+    from .features import FEATURES
+    from .io_utils import read_source
+    from .style import ALL_CATS, address_style, common_tokens, name_category, street_mismatch, style_additions
+    names = FEATURES if X.shape[1] == len(FEATURES) else [f for f in FEATURES if f != "acro"]
+    col = lambda c: np.asarray(X[:, names.index(c)], dtype=np.float32)
+    s1 = load_prep("test", "s1", ["country", "name_core", "addr_norm"])
+    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    unseen_c = sorted(set(s1["country"].unique().to_list()) - seen)
+    if not unseen_c:
+        return np.zeros(len(p), dtype=bool)
+    country = s1["country"].to_numpy()
+    unseen = np.isin(country[s1r], unseen_c)
+    sx = load_prep("test", "sx", ["entity_id", "country", "name_core", "addr_norm", "src"])
+    # raw address style of the SX records of the unseen countries
+    style = {}
+    for k in (2, 3):
+        raw = read_source("test", k).filter(pl.col("country").is_in(unseen_c))
+        for e, a, c in zip(raw["entity_id"].to_list(), raw["business_address"].to_list(), raw["country"].to_list()):
+            style[e] = address_style(a, c)
+        del raw
+    ids = sx["entity_id"].to_list()
+    nf_sx = np.array([style.get(e, (-1, -1))[0] for e in ids], dtype=np.int16)
+    reg_sx = np.array([style.get(e, (-1, -1))[1] for e in ids], dtype=np.int8)
+    del style, ids
+    matched = np.unique(sxr[mask0])
+    cand = unseen & (col("hn_off") == 0) & (col("addr_empty_x") < 0.5) & ~mask0 & ~np.isin(sxr, matched)
+    rows = np.flatnonzero(cand | (keep & (p >= 0.99) & unseen & (col("hn_off") == 0)))   # candidates + anchors
+    ncat = np.full(len(p), "", dtype=object)
+    n1 = s1["name_core"].to_numpy()
+    nx = sx["name_core"].to_numpy()
+    ncat[rows] = [name_category(n1[a], nx[b]) for a, b in zip(s1r[rows], sxr[rows])]
+    cand &= np.isin(ncat, ALL_CATS)
+    common = common_tokens(s1.filter(pl.col("country").is_in(unseen_c))["addr_norm"].to_list())
+    a1, ax = s1["addr_norm"].to_numpy(), sx["addr_norm"].to_numpy()
+    smis = np.zeros(len(p), dtype=np.int8)
+    cr = np.flatnonzero(cand)
+    smis[cr] = [street_mismatch(a1[a], ax[b], common) for a, b in zip(s1r[cr], sxr[cr])]
+    add = style_additions(s1r, sxr, p, keep, mask0, cand, nf_sx[sxr], reg_sx[sxr], sx["src"].to_numpy()[sxr], ncat, smis)
+    log(f"style additions: {int(cand.sum())} eligible, {int(add.sum())} added")
+    return add
+
+
 def _country_map(spec):
     return {k: float(v) for k, v in (kv.split("=") for kv in spec.split(","))} if spec else {}
 
@@ -901,6 +947,14 @@ def stage_rethreshold(args):
         del X
     mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject, post=post,
                    is_s3=is_s3, boost=boost)
+    if args.style_add:
+        from .decide import assign_best
+        X = np.load(work("feat", "test.npy"), mmap_mode="r")
+        add = _style_additions(s1r, sxr, p, X, mask, assign_best(sxr, p))
+        del X
+        p = np.where(add, np.float32(0.95) + np.float32(0.05) * p, p)   # order among additions preserved
+        mask = _decide(s1r, sxr, p, decision, s1_country=s1["country"].to_numpy(), reject=reject, post=post,
+                       is_s3=is_s3, boost=boost)
     write_submission(config.OUT_DIR, s1["entity_id"].to_list(), sx_ids, s1r, sxr, mask)
     log("rethreshold", decision, "matched pairs", int(mask.sum()))
     del sx_ids, s1r, sxr, p, mask
@@ -937,6 +991,8 @@ def main():
     ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
     ap.add_argument("--caps", action="store_true", help="rethreshold: at most 5 S2 and 6 S3 matches per S1")
     ap.add_argument("--rules", default="", help="lookalike rules to apply (default src/lookalike.RULES)")
+    ap.add_argument("--style-add", action="store_true",
+                    help="rethreshold: add unmatched same-number copies in unseen countries whose address style matches the S1's copies")
     ap.add_argument("--word-boost", action="store_true",
                     help="rethreshold: raise exact-address dual-role word copies in unseen countries (lookalike.word_boost)")
     ap.add_argument("--rounds-s1", type=int, default=640, help="stage2-final: rounds of each stage-1 fold judge")
