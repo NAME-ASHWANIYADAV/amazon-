@@ -556,6 +556,50 @@ def stage_stage2_final(args):
     log(f"final stage-2: {args.rounds_s2} rounds on {len(y)} pairs")
 
 
+def stage_stage3_features(args):
+    """Stage-3 generator-structure features for V (--split train) or test, from the stage-2 probabilities."""
+    from .stage3 import split_features
+    if args.split == "train":
+        pr = pl.read_parquet(work("feat", "train_V_pairs.parquet"), columns=["s1", "sx"])
+        p, prep, out = np.load(work("pred", "train_V_p2.npy")).astype(np.float32), "train", work("feat", "stage3_V.parquet")
+    else:
+        pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
+        p, prep, out = pr["p"].to_numpy().astype(np.float32), "test", work("feat", "stage3_test.parquet")
+    split_features(prep, pr["s1"].to_numpy(), pr["sx"].to_numpy(), p, out, log=log)
+    log("stage-3 features", out)
+
+
+def stage_stage3_train(args):
+    """Train the stage-3 recalibrator on V (labels) and save models/stage3.txt."""
+    from .stage3 import NEW_F, train
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
+    f = pl.read_parquet(work("feat", "stage3_V.parquet")).sort("i")
+    assert f.height == pv.height
+    feats = {c: f[c].to_numpy().astype(np.float32) for c in NEW_F}
+    m = train(np.load(work("feat", "train_V.npy"), mmap_mode="r"), feats, np.load(work("pred", "train_V_p2.npy")),
+              pv["label"].to_numpy())
+    m.save_model(work("models", "stage3.txt"))
+    log("stage-3 model saved")
+
+
+def stage_stage3_predict(args):
+    """Stage-3 probabilities for test (pred/test_pairs_p3.parquet) with the shift and unseen-country guards."""
+    import lightgbm as lgb
+
+    from .features import FEATURES
+    from .stage3 import guard, predict
+    pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
+    p2 = pr["p"].to_numpy().astype(np.float32)
+    X = np.load(work("feat", "test.npy"), mmap_mode="r")
+    assert X.shape[0] == pr.height
+    p3 = predict(lgb.Booster(model_file=work("models", "stage3.txt")), X, work("feat", "stage3_test.parquet"), p2)
+    seen = set(load_prep("train", "s1", ["country"])["country"].unique().to_list())
+    unseen = ~np.isin(load_prep("test", "s1", ["country"])["country"].to_numpy()[pr["s1"].to_numpy()], sorted(seen))
+    p = guard(p2, p3, np.asarray(X[:, FEATURES.index("hn_in_set")]) > 0.5, unseen)
+    pr.with_columns(pl.Series("p", p)).write_parquet(work("pred", "test_pairs_p3.parquet"))
+    log(f"stage-3 applied to {int((~unseen).sum())} pairs of seen countries; mean |p3-p2| {np.abs(p - p2)[~unseen].mean():.4f}")
+
+
 def stage_predict_stage2(args):
     """Test predictions with the stage-2 judge from saved test features (written by predict-test)."""
     import json
@@ -829,14 +873,15 @@ def stage_rethreshold(args):
     import json
 
     from .io_utils import write_submission
-    with open(work("models", "decision_s2.json" if args.stage2 else "decision.json")) as f:
+    with open(work("models", "decision_s2.json" if (args.stage2 or args.stage3) else "decision.json")) as f:
         decision = json.load(f)
     decision.update({"rule": args.rule, "threshold": args.thr if args.thr is not None else decision["threshold"]})
     decision["country_thr"] = _country_map(args.country_thr)
     decision["country_shift"] = _country_map(args.country_shift)
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
-    scored = pl.read_parquet(work("pred", "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
+    scored = pl.read_parquet(work("pred", "test_pairs_p3.parquet" if args.stage3 else
+                                  "test_pairs_p2.parquet" if args.stage2 else "test_pairs_p.parquet"))
     s1r, sxr, p = scored["s1"].to_numpy(), scored["sx"].to_numpy(), scored["p"].to_numpy()
     del scored
     reject, post, is_s3, boost = None, None, None, None
@@ -866,7 +911,8 @@ def stage_rethreshold(args):
 STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encode": stage_encode,
           "candidates": stage_candidates, "address-pass": stage_address_pass, "tokens": stage_tokens,
           "vocab": stage_vocab, "stage2": stage_stage2, "predict-stage2": stage_predict_stage2,
-          "stage2-final": stage_stage2_final,
+          "stage2-final": stage_stage2_final, "stage3-features": stage_stage3_features,
+          "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -885,6 +931,7 @@ def main():
     ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
     ap.add_argument("--country-shift", default="", help="per-country logit shifts of p, e.g. France=-0.9")
     ap.add_argument("--stage2", action="store_true", help="rethreshold: use the stage-2 probabilities")
+    ap.add_argument("--stage3", action="store_true", help="rethreshold: use the stage-3 probabilities")
     ap.add_argument("--shift-rule", action="store_true",
                     help="never match an SX shifted by a distractor offset >= 3 when copies confirm the S1 number")
     ap.add_argument("--lookalike", action="store_true", help="rethreshold: drop lookalike fake groups (src/lookalike.py)")
