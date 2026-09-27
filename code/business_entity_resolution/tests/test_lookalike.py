@@ -85,3 +85,19 @@ def test_word_boost_only_exact_address_single_extra_word_unseen_country():
     got = word_boost(tok, vocab, s1r, sxr, cols, np.ones(4, bool))
     assert got.tolist() == [True, False, False, False]   # other address / word already in S1 / not a boost word
     assert not word_boost(tok, vocab, s1r, sxr, cols, np.zeros(4, bool)).any()
+
+
+def test_common_word_swap_flags_only_non_typo_common_swaps():
+    from src.lookalike import common_word_swap
+    vocab = ["amicale", "du", "team", "comite", "amicalle", "fils", "amic"]
+    # S1 0 = 'amicale du team'; S1 names carry 'comite' 300 times (common) so df >= 200
+    ns1_ptr = np.array([0, 3] + [4 + i for i in range(300)])
+    ns1_ids = np.array([0, 1, 2] + [3] * 300)
+    # SX 0 'comite du team' (swap common), 1 'amicalle du team' (typo), 2 'fils du team' (noise), 3 'amic du team' (abbr)
+    nsx_ptr = np.array([0, 3, 6, 9, 12])
+    nsx_ids = np.array([1, 2, 3, 1, 2, 4, 1, 2, 5, 1, 2, 6])
+    tok = {"ns1_ptr": ns1_ptr, "ns1_ids": ns1_ids, "nsx_ptr": nsx_ptr, "nsx_ids": nsx_ids}
+    s1r, sxr = np.zeros(4, np.int64), np.arange(4)
+    got = common_word_swap(tok, vocab, s1r, sxr, np.ones(4, bool))
+    assert got.tolist() == [True, False, False, False]
+    assert not common_word_swap(tok, vocab, s1r, sxr, np.array([False, True, True, True])).any()

@@ -14,14 +14,20 @@ Every rule uses a generator regularity measured on train truth:
   copies confirm the S1 number (RF). True number typos are sign-symmetric (+1/+2 as often as -1/-2 in V);
   test France has 11x more +1/+2 than -1/-2 predictions in exactly this cell.
 Rejected pairs are removed after the SX -> best-S1 assignment (so the SX does not flow to another S1)."""
+import numba
 import numpy as np
 import polars as pl
+from rapidfuzz.distance import Levenshtein
 
 DISTRACTOR_SET = [1, 2, 3, 4, 5, 7, 9, 11, 13, 21]
 FAKE_WORDS = ("holding", "holdings", "group", "groupe", "participations")
 COUNTRY_WORD = {"France": "france", "India": "india"}
-NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3"]
-ALL_RULES = ("R1", "RA", "RM", "RB", "W", "RF", "RL")
+NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3",
+             "addr_empty_x"]
+ALL_RULES = ("R1", "RA", "RM", "RB", "W", "RF", "RL", "RW")
+# words a true copy may swap in or add (copy noise in train and, by their exact-address profile, in France)
+COPY_NOISE_WORDS = frozenset("center services service partners fils cie associes groupe developpement france".split())
+COMMON_WORD_DF = 200   # a swapped-in word counts as 'common' when at least this many S1 names contain it
 # default package: R1+RM+RB+W, plus RF (countries unseen in training) and RL (countries whose true copies almost
 # never swap legal forms). Per-rule mirror accounting (+1/+2 vs -1/-2 predictions) finds each of them net positive;
 # RA is left out (zero net in India, and it overlaps R1 elsewhere). Full-V cost of the package: -0.00018.
@@ -76,6 +82,58 @@ def extra_words(tok, vocab, s1r, sxr, pair_country):
     return out
 
 
+@numba.njit(parallel=True, cache=True)
+def _single_diff(a_ptr, a_ids, b_ptr, b_ids, pa, pb, out):
+    """Sorted token-id sets A (S1) and B (SX): out[q] = (|B-A|, |A-B|, first id of B-A, first id of A-B)."""
+    for q in numba.prange(len(pa)):
+        i, j = pa[q], pb[q]
+        x, xe, y, ye = a_ptr[i], a_ptr[i + 1], b_ptr[j], b_ptr[j + 1]
+        ne, nm, fe, fm = 0, 0, -1, -1
+        while x < xe or y < ye:
+            if y >= ye or (x < xe and a_ids[x] < b_ids[y]):
+                if nm == 0:
+                    fm = a_ids[x]
+                nm += 1
+                x += 1
+            elif x >= xe or b_ids[y] < a_ids[x]:
+                if ne == 0:
+                    fe = b_ids[y]
+                ne += 1
+                y += 1
+            else:
+                x += 1
+                y += 1
+        out[q, 0], out[q, 1], out[q, 2], out[q, 3] = ne, nm, fe, fm
+
+
+def _subseq(a, b):
+    if not a or not b or a[0] != b[0]:
+        return False
+    it = iter(b)
+    return all(ch in it for ch in a)
+
+
+def common_word_swap(tok, vocab, s1r, sxr, cand, df_min=COMMON_WORD_DF):
+    """Pair flag (only where cand): the SX name is the S1 name with exactly one word swapped for a COMMON word
+    (found in >= df_min S1 names) that is not a typo of the old word (Levenshtein similarity < 0.6), not an
+    abbreviation of it, and not copy noise. In train (V) such swaps at the same house number are 90-99% fakes
+    (lookalike businesses: 'amicale du team' -> 'comite du team'); test France predicts 30x more of them."""
+    idx = np.flatnonzero(cand)
+    d = np.zeros((len(idx), 4), dtype=np.int64)
+    _single_diff(tok["ns1_ptr"], tok["ns1_ids"], tok["nsx_ptr"], tok["nsx_ids"], s1r[idx].astype(np.int64),
+                 sxr[idx].astype(np.int64), d)
+    one = (d[:, 0] == 1) & (d[:, 1] == 1)
+    df1 = np.bincount(tok["ns1_ids"], minlength=len(vocab))
+    out = np.zeros(len(s1r), dtype=bool)
+    sub = np.flatnonzero(one & (df1[np.maximum(d[:, 2], 0)] >= df_min))
+    for k in sub:
+        e, m = vocab[d[k, 2]], vocab[d[k, 3]]
+        if e in COPY_NOISE_WORDS or Levenshtein.normalized_similarity(e, m) >= 0.6 or _subseq(e, m) or _subseq(m, e):
+            continue
+        out[idx[k]] = True
+    return out
+
+
 def legal_dropped(s1_legal, sx_legal, s1r, sxr):
     """Pair flag: the S1 has a legal form and the SX has none (a symmetric, true-copy edit)."""
     e1 = np.array([not s for s in s1_legal], dtype=bool)
@@ -104,10 +162,12 @@ def word_boost(tok, vocab, s1r, sxr, cols, unseen):
             & (c["num_primary_eq"] > 0.5) & (c["addr_empty_x"] < 0.5))
 
 
-def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None, strict=None):
+def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None, strict=None,
+                     rw=None):
     """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words;
     ldrop: pair flag from legal_dropped; unseen: pair flag 'S1 country not in the training data' (RF only);
     strict: pair flag 'S1 country's train true copies swap legal forms under LEGAL_SWAP_STRICT' (RL only).
+    rw: pair flag from common_word_swap (RW only; the caller restricts it to unseen countries at offset 0).
     Returns (reject mask, {rule: mask}) over pairs; only kept (assigned) pairs are ever rejected."""
     n = len(p)
     off = np.asarray(cols["hn_off"], dtype=np.float32)
@@ -122,6 +182,7 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "ldrop": np.zeros(n, dtype=bool) if ldrop is None else ldrop,
         "unseen": np.zeros(n, dtype=bool) if unseen is None else unseen,
         "strict": np.zeros(n, dtype=bool) if strict is None else strict,
+        "rw": np.zeros(n, dtype=bool) if rw is None else rw,
     }).with_columns(pl.col("off").fill_nan(None))
     num = pl.col("off").is_not_null() & (pl.col("off") != 0)
     anc = (pl.col("keep") & (pl.col("p") >= tau) & (pl.col("off") == 0)).fill_null(False).cast(pl.Int32)
@@ -141,6 +202,7 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "W": pl.col("xword") & (pl.col("off") >= 3),   # below 3 the mirror test says these include true typos
         "RF": pl.col("unseen") & off12 & (pl.col("sib1") >= 1) & (pl.col("xleg") | pl.col("ndiff")) & ~pl.col("ldrop"),
         "RL": pl.col("strict") & off12 & (pl.col("sib1") >= 1) & pl.col("xleg"),
+        "RW": pl.col("rw"),
     }
     df = df.with_columns([(e & pl.col("keep")).fill_null(False).alias(k) for k, e in exprs.items()])
     # R1 condemns the whole (S1, number) group of the lookalike, including its copies from the other source
