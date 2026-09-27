@@ -37,7 +37,8 @@ COLOC_F = ["co_key2", "co_numkey", "co_contain", "co_self", "co_logdf1", "co_unk
 # G2 digit-level edit type of the aligned house numbers (transposition / one digit replaced / digit dropped ...
 # vs a distractor shift), categorical; V +0.00021 through interactions
 DIGIT_F = ["de_code", "de_nd_a", "de_nd_b", "de_slog"]
-NEW_F = NUM_F + ADDR_F + MISC_F + EDIT_F + COLOC_F + DIGIT_F
+STAGE2_F = NUM_F + ADDR_F + MISC_F + EDIT_F        # the generator-structure columns the stage-2+ judge uses
+NEW_F = STAGE2_F + COLOC_F + DIGIT_F              # all of them: the stage-3 recalibrator
 CAT_F = ["de_code"]
 DE_CODES = {"eq": 0, "eq2": 1, "shift_set": 2, "neg12": 3, "repl1_first": 4, "repl1_mid": 5, "repl1_last": 6, "transp": 7,
             "lead_digit": 8, "trail_digit": 9, "mid_digit": 10, "repl2": 11, "other_samelen": 12, "other_len1": 13,

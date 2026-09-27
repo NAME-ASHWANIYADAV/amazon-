@@ -65,11 +65,26 @@ def finetune(tok, model, a, b, y, epochs=1, batch=64, lr=4e-5, log=print, seed=0
     return model
 
 
-@torch.no_grad()
-def score(tok, model, a, b, batch=256, device="cuda"):
+@torch.inference_mode()
+def score(tok, model, a, b, batch=512, device="cuda", tok_chunk=8192, log=None):
+    """Logits for all pairs: tokenisation in large chunks (the fast tokenizer is the bottleneck), GPU batches."""
     out = np.empty(len(a), dtype=np.float32)
     model.eval()
-    for enc, i in _batches(tok, a, b, np.arange(len(a)), batch, device):
-        with torch.autocast("cuda", dtype=torch.float16):
-            out[i] = model(**enc).logits.squeeze(-1).float().cpu().numpy()
+    for s in range(0, len(a), tok_chunk):
+        e = min(len(a), s + tok_chunk)
+        enc = tok(a[s:e], b[s:e], truncation=True, max_length=MAX_LEN, padding=True, return_tensors="pt")
+        for q in range(s, e, batch):
+            sl = slice(q - s, min(e, q + batch) - s)
+            part = {k: v[sl].to(device) for k, v in enc.items()}
+            with torch.autocast("cuda", dtype=torch.float16):
+                out[q:q + (sl.stop - sl.start)] = model(**part).logits.squeeze(-1).float().cpu().numpy()
+        if log and (s // tok_chunk) % 25 == 0:
+            log(f"  ce scored {e}/{len(a)}")
     return out
+
+
+def blend(p, ce, w):
+    """Logistic blend of the judge probability and the cross-encoder logit: w = (w_logit, w_ce, bias)."""
+    lz = np.log(np.clip(p, 1e-6, 1 - 1e-6) / np.clip(1 - p, 1e-6, 1))
+    z = w[0] * lz + w[1] * ce + w[2]
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)

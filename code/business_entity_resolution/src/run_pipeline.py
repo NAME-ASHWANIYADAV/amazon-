@@ -632,7 +632,7 @@ def stage_stage2_plus(args):
     stage-1 view: feat/stage3_J.parquet, feat/stage3_V1.parquet). Validates on V and saves models/judge_s2plus.json."""
     from . import judge
     from .context import stage2_features
-    from .stage3 import NEW_F
+    from .stage3 import STAGE2_F as NEW_F
     tok = _load_tok("train")
     pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
     pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
@@ -662,7 +662,7 @@ def _stage2_plus_matrices():
     """(XJ, yj, n_eval, XV, yv) of the stage-2+ judge: features + within-list stage-1 context + generator-structure
     features (out-of-fold stage-1 view for J, fold-mean view for V)."""
     from .context import stage2_features
-    from .stage3 import NEW_F
+    from .stage3 import STAGE2_F as NEW_F
     tok = _load_tok("train")
     pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
     pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
@@ -706,7 +706,7 @@ def stage_predict_stage2_plus(args):
 
     from . import judge
     from .context import stage2_features
-    from .stage3 import NEW_F, split_features
+    from .stage3 import STAGE2_F as NEW_F, split_features
     tok = _load_tok("test")
     pr = pl.read_parquet(work("pred", "test_pairs_p.parquet"), columns=["s1", "sx"])
     s1r, sxr = pr["s1"].to_numpy(), pr["sx"].to_numpy()
@@ -737,6 +737,97 @@ def stage_predict_stage2_plus(args):
     shutil.copyfile(work("pred", "train_V_p2plus_avg.npy" if avg else "train_V_p2plus.npy"), work("pred", "train_V_p2.npy"))
     shutil.copyfile(work("models", "decision_s2plus_avg.json" if avg else "decision_s2plus.json"), work("models", "decision_s2.json"))
     log("stage-2+ test probabilities written; stage 2+ is now the stage 2 of the pipeline")
+
+
+CE_GREY = (0.01, 0.99)   # the cross-encoder re-scores pairs the stage-2 judge is unsure about
+
+
+def _ce_texts(split, s1r, sxr):
+    from .cross_encoder_pt import texts
+    s1 = load_prep(split, "s1", ["name_norm", "addr_norm"])
+    sx = load_prep(split, "sx", ["name_norm", "addr_norm"])
+    a = texts(s1["name_norm"].gather(s1r).to_list(), s1["addr_norm"].gather(s1r).to_list())
+    b = texts(sx["name_norm"].gather(sxr).to_list(), sx["addr_norm"].gather(sxr).to_list())
+    return a, b
+
+
+def stage_ce_train(args):
+    """Fine-tune the pretrained multilingual cross-encoder on the J grey zone (out-of-fold stage-1 p), score the
+    V grey zone (stage-2 p), fit the logistic blend on V (cross-fitted by S1 parity for the report, then on all
+    of V for the weights) and save models/ce_pt + models/ce_blend.json. Needs the GPU."""
+    import json
+
+    import torch
+    from sklearn.linear_model import LogisticRegression
+
+    from .cross_encoder_pt import blend, finetune, load, score
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"), columns=["s1", "sx", "label"])
+    p1 = np.load(work("pred", "train_J_p1oof.npy"))
+    rng = np.random.default_rng(0)
+    grey = (p1 >= 0.02) & (p1 <= 0.98)
+    sel = np.flatnonzero(grey | (rng.random(len(p1)) < 0.04))
+    if len(sel) > args.ce_pairs:
+        sel = np.sort(rng.choice(sel, args.ce_pairs, replace=False))
+    a, b = _ce_texts("train", pj["s1"].to_numpy()[sel], pj["sx"].to_numpy()[sel])
+    log(f"cross-encoder: {len(sel)} J training pairs (grey zone {int(grey.sum())})")
+    tok, model = load(args.ce_model)
+    model = finetune(tok, model, a, b, pj["label"].to_numpy()[sel], epochs=args.epochs, log=log)
+    model.save_pretrained(work("models", "ce_pt"))
+    tok.save_pretrained(work("models", "ce_pt"))
+    del a, b
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"), columns=["s1", "sx", "label"])
+    p2 = np.load(work("pred", "train_V_p2.npy"))
+    vi = np.flatnonzero((p2 > CE_GREY[0]) & (p2 < CE_GREY[1]))
+    a, b = _ce_texts("train", pv["s1"].to_numpy()[vi], pv["sx"].to_numpy()[vi])
+    ce = np.zeros(len(p2), dtype=np.float32)
+    ce[vi] = score(tok, model, a, b, log=log)
+    np.save(work("pred", "ce_V_logit.npy"), ce)
+    del model
+    torch.cuda.empty_cache()
+    lab = pv["label"].to_numpy().astype(bool)
+    lz = np.log(np.clip(p2, 1e-6, 1 - 1e-6) / np.clip(1 - p2, 1e-6, 1))
+    half = pv["s1"].to_numpy() % 2 == 0
+    pb = p2.astype(np.float32).copy()
+    for fit in (True, False):   # cross-fitted V probabilities for the downstream stages
+        tr = (half if fit else ~half) & (ce != 0)
+        te = (~half if fit else half) & (ce != 0)
+        lr = LogisticRegression(C=1.0, max_iter=300).fit(np.c_[lz[tr], ce[tr]], lab[tr])
+        pb[te] = lr.predict_proba(np.c_[lz[te], ce[te]])[:, 1]
+    m = ce != 0
+    lr = LogisticRegression(C=1.0, max_iter=300).fit(np.c_[lz[m], ce[m]], lab[m])
+    w = [float(lr.coef_[0][0]), float(lr.coef_[0][1]), float(lr.intercept_[0])]
+    with open(work("models", "ce_blend.json"), "w") as f:
+        json.dump({"w": w, "grey": CE_GREY}, f)
+    np.save(work("pred", "train_V_p2_ce.npy"), pb)
+    log("cross-encoder blend weights", w)
+    log("stage-2 + cross-encoder on V:")
+    _validate_probs(pb, "decision_ce.json")
+
+
+def stage_ce_apply(args):
+    """Score the test grey zone with the fine-tuned cross-encoder and blend it into pred/test_pairs_p2.parquet
+    (the stage-2 view of the later stages; V probabilities switch to the cross-fitted blend)."""
+    import json
+    import shutil
+
+    from .cross_encoder_pt import blend, load, score
+    with open(work("models", "ce_blend.json")) as f:
+        cfg = json.load(f)
+    pr = pl.read_parquet(work("pred", "test_pairs_p2.parquet"))
+    p = pr["p"].to_numpy().astype(np.float32)
+    ti = np.flatnonzero((p > cfg["grey"][0]) & (p < cfg["grey"][1]))
+    log(f"cross-encoder: test grey zone {len(ti)} of {len(p)} pairs")
+    a, b = _ce_texts("test", pr["s1"].to_numpy()[ti], pr["sx"].to_numpy()[ti])
+    tok, model = load(work("models", "ce_pt"))
+    ce = score(tok, model, a, b, log=log)
+    np.save(work("pred", "ce_test_logit.npy"), np.c_[ti, ce])
+    p_new = p.copy()
+    p_new[ti] = blend(p[ti], ce, cfg["w"])
+    shutil.copyfile(work("pred", "test_pairs_p2.parquet"), work("pred", "test_pairs_p2_noce.parquet"))
+    pr.with_columns(pl.Series("p", p_new)).write_parquet(work("pred", "test_pairs_p2.parquet"))
+    shutil.copyfile(work("pred", "train_V_p2_ce.npy"), work("pred", "train_V_p2.npy"))
+    shutil.copyfile(work("models", "decision_ce.json"), work("models", "decision_s2.json"))
+    log(f"blended {len(ti)} pairs; mean p in the grey zone {p[ti].mean():.4f} -> {p_new[ti].mean():.4f}")
 
 
 def stage_stage3_features(args):
@@ -1207,7 +1298,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
           "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
           "predict-unseen": stage_predict_unseen,
           "stage2-plus": stage_stage2_plus, "predict-stage2-plus": stage_predict_stage2_plus,
-          "stage2-plus-seeds": stage_stage2_plus_seeds,
+          "stage2-plus-seeds": stage_stage2_plus_seeds, "ce-train": stage_ce_train, "ce-apply": stage_ce_apply,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -1240,6 +1331,9 @@ def main():
                     help="rethreshold: raise exact-address dual-role word copies in unseen countries (lookalike.word_boost)")
     ap.add_argument("--rounds", type=int, default=3, help="predict-unseen: pseudo word log-odds rounds")
     ap.add_argument("--seeds", type=int, default=3, help="stage2-plus-seeds: number of seeds including seed 0")
+    ap.add_argument("--ce-pairs", type=int, default=120_000, help="ce-train: J grey-zone pairs to fine-tune on")
+    ap.add_argument("--ce-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+                    help="ce-train: pretrained cross-encoder (Hugging Face id or local folder)")
     ap.add_argument("--self-train", action="store_true", help="predict-unseen: cross-fitted self-trained stage-1 judges")
     ap.add_argument("--rounds-s1", type=int, default=640, help="stage2-final: rounds of each stage-1 fold judge")
     ap.add_argument("--rounds-s2", type=int, default=640, help="stage2-final: rounds of the stage-2 judge")
