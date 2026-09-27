@@ -658,6 +658,44 @@ def stage_stage2_plus(args):
     _validate_probs(p2, "decision_s2plus.json")
 
 
+def _stage2_plus_matrices():
+    """(XJ, yj, n_eval, XV, yv) of the stage-2+ judge: features + within-list stage-1 context + generator-structure
+    features (out-of-fold stage-1 view for J, fold-mean view for V)."""
+    from .context import stage2_features
+    from .stage3 import NEW_F
+    tok = _load_tok("train")
+    pj = pl.read_parquet(work("feat", "train_J_pairs.parquet"))
+    pv = pl.read_parquet(work("feat", "train_V_pairs.parquet"))
+    p1j = np.load(work("pred", "train_J_p1oof.npy"))
+    p1v = np.load(work("pred", "train_V_p1avg.npy"))
+    fj = pl.read_parquet(work("feat", "stage3_J.parquet")).sort("i")
+    fv = pl.read_parquet(work("feat", "stage3_V1.parquet")).sort("i")
+    G = lambda f: np.column_stack([f[c].to_numpy().astype(np.float32) for c in NEW_F])
+    XJ = np.hstack([np.load(work("feat", "train_J.npy")).astype(np.float32),
+                    stage2_features(tok, pj["s1"].to_numpy(), pj["sx"].to_numpy(), p1j), G(fj)])
+    XV = np.hstack([np.load(work("feat", "train_V.npy")).astype(np.float32),
+                    stage2_features(tok, pv["s1"].to_numpy(), pv["sx"].to_numpy(), p1v), G(fv)])
+    return XJ, pj["label"].to_numpy().astype(np.float32), int((pj["s1"] % 10 == 0).sum()), XV, pv["label"].to_numpy().astype(np.float32)
+
+
+def stage_stage2_plus_seeds(args):
+    """Stage-2+ judges with extra seeds (models/judge_s2plus_seed{k}.json); validates the seed average on V."""
+    from . import judge
+    XJ, yj, n_eval, XV, _ = _stage2_plus_matrices()
+    ps = [np.load(work("pred", "train_V_p2plus.npy"))]
+    for k in range(1, args.seeds):
+        judge.PARAMS = {**judge.PARAMS, "seed": k}
+        m = judge.train(XJ, yj, n_eval)
+        m.save_model(work("models", f"judge_s2plus_seed{k}.json"))
+        ps.append(judge.predict(m, XV))
+        log(f"stage-2+ seed {k}: best iteration {m.best_iteration}")
+        del m
+    p = np.mean(ps, axis=0).astype(np.float32)
+    np.save(work("pred", "train_V_p2plus_avg.npy"), p)
+    log(f"stage-2+ average of {len(ps)} seeds on V:")
+    _validate_probs(p, "decision_s2plus_avg.json")
+
+
 def stage_predict_stage2_plus(args):
     """Test probabilities of the stage-2+ judge (models/judge_s2plus.json): stage-1 fold-mean p, stage-3
     generator-structure features from it (feat/stage3_test1.parquet), within-list stage-2 features. Writes
@@ -680,19 +718,24 @@ def stage_predict_stage2_plus(args):
         split_features("test", s1r, sxr, p1.astype(np.float32), g_path, log=log)
     S2 = stage2_features(tok, s1r, sxr, p1)
     del tok
-    m2 = xgb.Booster(model_file=work("models", "judge_s2plus.json"))
+    import glob
+    files = [work("models", "judge_s2plus.json")] + sorted(glob.glob(work("models", "judge_s2plus_seed*.json")))
+    models = [xgb.Booster(model_file=f) for f in files]
+    log(f"stage-2+ judges: {len(models)} (seed average)")
     p2 = np.empty(len(p1), dtype=np.float32)
     for b in range(0, len(p1), FEAT_CHUNK):
         e = min(len(p1), b + FEAT_CHUNK)
         g = pl.scan_parquet(g_path).slice(b, e - b).collect()
         assert g["i"][0] == b
         G = np.column_stack([g[c].to_numpy().astype(np.float32) for c in NEW_F])
-        p2[b:e] = judge.predict(m2, np.hstack([np.asarray(X[b:e], dtype=np.float32), S2[b:e], G]))
-        del g, G
+        Xc = np.hstack([np.asarray(X[b:e], dtype=np.float32), S2[b:e], G])
+        p2[b:e] = np.mean([judge.predict(m, Xc) for m in models], axis=0)
+        del g, G, Xc
         log(f"  stage-2+ scored {e}/{len(p1)}")
     pl.DataFrame({"s1": s1r, "sx": sxr, "p": p2}).write_parquet(work("pred", "test_pairs_p2.parquet"))
-    shutil.copyfile(work("pred", "train_V_p2plus.npy"), work("pred", "train_V_p2.npy"))
-    shutil.copyfile(work("models", "decision_s2plus.json"), work("models", "decision_s2.json"))
+    avg = len(models) > 1 and os.path.exists(work("pred", "train_V_p2plus_avg.npy"))
+    shutil.copyfile(work("pred", "train_V_p2plus_avg.npy" if avg else "train_V_p2plus.npy"), work("pred", "train_V_p2.npy"))
+    shutil.copyfile(work("models", "decision_s2plus_avg.json" if avg else "decision_s2plus.json"), work("models", "decision_s2.json"))
     log("stage-2+ test probabilities written; stage 2+ is now the stage 2 of the pipeline")
 
 
@@ -1162,6 +1205,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
           "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
           "predict-unseen": stage_predict_unseen,
           "stage2-plus": stage_stage2_plus, "predict-stage2-plus": stage_predict_stage2_plus,
+          "stage2-plus-seeds": stage_stage2_plus_seeds,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
@@ -1193,6 +1237,7 @@ def main():
     ap.add_argument("--word-boost", action="store_true",
                     help="rethreshold: raise exact-address dual-role word copies in unseen countries (lookalike.word_boost)")
     ap.add_argument("--rounds", type=int, default=3, help="predict-unseen: pseudo word log-odds rounds")
+    ap.add_argument("--seeds", type=int, default=3, help="stage2-plus-seeds: number of seeds including seed 0")
     ap.add_argument("--self-train", action="store_true", help="predict-unseen: cross-fitted self-trained stage-1 judges")
     ap.add_argument("--rounds-s1", type=int, default=640, help="stage2-final: rounds of each stage-1 fold judge")
     ap.add_argument("--rounds-s2", type=int, default=640, help="stage2-final: rounds of the stage-2 judge")

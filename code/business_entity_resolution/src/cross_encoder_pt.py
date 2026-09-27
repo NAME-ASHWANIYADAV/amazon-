@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 MODEL_ID = r"C:\amazon_ml\work\models\mminilm"   # local copy of cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 (Apache-2.0)
-MAX_LEN = 96
+MAX_LEN = int(__import__("os").environ.get("CE_MAX_LEN", "72"))
 
 
 def load(model_id=MODEL_ID, device="cuda"):
@@ -32,7 +32,7 @@ def _batches(tok, a, b, idx, batch, device):
         yield {k: v.to(device) for k, v in enc.items()}, i
 
 
-def finetune(tok, model, a, b, y, epochs=1, batch=48, lr=3e-5, log=print, seed=0, device="cuda"):
+def finetune(tok, model, a, b, y, epochs=1, batch=64, lr=4e-5, log=print, seed=0, device="cuda"):
     """a/b: lists of pair texts; y: 0/1 labels."""
     torch.manual_seed(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
