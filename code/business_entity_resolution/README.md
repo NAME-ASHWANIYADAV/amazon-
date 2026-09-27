@@ -63,6 +63,8 @@ python -m src.run_pipeline stage3-train                     # stage-3 recalibrat
 python -m src.run_pipeline stage3-features --split test
 python -m src.run_pipeline stage3-predict                   # stage-3 test probabilities (guarded)
 python -m src.run_pipeline rethreshold --stage3 --rule expected_f --shift-rule --lookalike --caps --word-boost --style-add --block-add
+# optional, evaluated and NOT used for the final upload: per-country, per-band label-shift correction of p
+#   --band-shift-file band_shift.json   (JSON {country: [[p_knot, logit_shift], ...]}, see band_shift() in run_pipeline)
 ```
 
 (`predict-stage2` is the plain stage-2 judge without the generator-structure features, kept for comparison.)

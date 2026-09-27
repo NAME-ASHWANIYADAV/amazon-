@@ -1043,6 +1043,24 @@ def _word_boost(split, s1r, sxr, X):
     return word_boost(tok, vocab, s1r, sxr, cols, unseen)
 
 
+def band_shift(p, knots):
+    """Label-shift correction of calibrated probabilities for one country: add to logit(p) a shift that is
+    piecewise linear in logit(p) through the (p_knot, shift) knots (constant outside them). The knots come
+    from the label-free excess of test candidates per judge-probability band over the validation density:
+    shift = logit(pi_test) - logit(pi_V). A negative slope steeper than -1 would break monotonicity, so the
+    knots are checked."""
+    kp = np.array([k[0] for k in knots], dtype=np.float64)
+    ks = np.array([k[1] for k in knots], dtype=np.float64)
+    kz = np.log(kp / (1 - kp))
+    order = np.argsort(kz)
+    kz, ks = kz[order], ks[order]
+    if np.any(np.diff(ks) / np.diff(kz) <= -1):
+        raise ValueError("band_shift knots are not monotone in logit space")
+    z = np.log(np.clip(p, 1e-6, 1 - 1e-6) / np.clip(1 - p, 1e-6, 1)).astype(np.float64)
+    z = z + np.interp(z, kz, ks)
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+
+
 def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s3=None, boost=None):
     """Assignment, then the decision rule. decision["country_thr"] (optional, threshold rule only)
     overrides the threshold for S1s of the named countries (s1_country: per-S1-row country array).
@@ -1065,6 +1083,13 @@ def _decide(s1r, sxr, p, decision, s1_country=None, reject=None, post=None, is_s
             m = s1_country[s1r] == c
             z = np.log(np.clip(p[m], 1e-6, 1 - 1e-6) / np.clip(1 - p[m], 1e-6, 1)) + d
             p[m] = 1.0 / (1.0 + np.exp(-z))
+    band = decision.get("band_shift") or {}
+    if band:
+        p = np.asarray(p, dtype=np.float32).copy()
+        for c, knots in band.items():
+            m = s1_country[s1r] == c
+            p[m] = band_shift(p[m], knots)
+            log(f"band shift {c}: {int(m.sum())} pairs, mean p {float(np.mean(p[m])):.4f}")
     keep = assign_best(sxr, p)
     if post is not None:
         keep &= ~post(p, keep)
@@ -1235,6 +1260,10 @@ def stage_rethreshold(args):
     decision.update({"rule": args.rule, "threshold": args.thr if args.thr is not None else decision["threshold"]})
     decision["country_thr"] = _country_map(args.country_thr)
     decision["country_shift"] = _country_map(args.country_shift)
+    if args.band_shift_file:
+        with open(args.band_shift_file) as f:
+            decision["band_shift"] = json.load(f)
+        log(f"band shift table {args.band_shift_file}: {decision['band_shift']}")
     s1 = load_prep("test", "s1", ["entity_id", "country"])
     sx_ids = load_prep("test", "sx", ["entity_id"])["entity_id"].to_numpy()
     scored = pl.read_parquet(work("pred", "test_pairs_p3.parquet" if args.stage3 else
@@ -1320,6 +1349,8 @@ def main():
     ap.add_argument("--thr", type=float, default=None)
     ap.add_argument("--country-thr", default="", help="per-country thresholds, e.g. France=0.85,India=0.7")
     ap.add_argument("--country-shift", default="", help="per-country logit shifts of p, e.g. France=-0.9")
+    ap.add_argument("--band-shift-file", default="", help="rethreshold: JSON {country: [[p_knot, logit_shift], ...]} "
+                    "label-shift correction per probability band (see band_shift)")
     ap.add_argument("--stage2", action="store_true", help="rethreshold: use the stage-2 probabilities")
     ap.add_argument("--stage3", action="store_true", help="rethreshold: use the stage-3 probabilities")
     ap.add_argument("--shift-rule", action="store_true",
