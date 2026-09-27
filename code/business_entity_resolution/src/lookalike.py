@@ -24,15 +24,19 @@ FAKE_WORDS = ("holding", "holdings", "group", "groupe", "participations")
 STRONG_FAKE_WORDS = ("participations", "holding")   # ~0.2% at the exact address in unseen-country test data
 COUNTRY_WORD = {"France": "france", "India": "india"}
 NEED_COLS = ["hn_off", "hn_in_set", "hn_sib_1", "hn_sib_x", "cos_name", "xw_n_extra", "mw_n_miss", "is_s3",
-             "addr_empty_x"]
-ALL_RULES = ("R1", "RA", "RM", "RB", "W", "RF", "RL", "RW")
+             "addr_empty_x", "hn_composite", "hn_trunc", "num_x_unmatched", "num_nx", "legal_code"]
+ALL_RULES = ("R1", "RA", "RM", "RB", "W", "RF", "RL", "RW", "RC", "RP")
+# RC: the SX house number is a truncation of (S1 number + distractor shift) and the name only adds/changes a legal
+# form: test fakes rendered by a source whose address base drops a digit ('400 bay hill ct' -> 'valley critical co |
+# 01 bay hill ct'); 10x their mirror on test, symmetric in V. RP: 'partners' swapped in at +1/+2 (US: 157 vs 16).
+TEST_FAKE_WORDS = ("partners",)
 # words a true copy may swap in or add (copy noise in train and, by their exact-address profile, in France)
 COPY_NOISE_WORDS = frozenset("center services service partners fils cie associes groupe developpement france".split())
 COMMON_WORD_DF = 200   # a swapped-in word counts as 'common' when at least this many S1 names contain it
 # default package: R1+RM+RB+W, plus RF (countries unseen in training) and RL (countries whose true copies almost
 # never swap legal forms). Per-rule mirror accounting (+1/+2 vs -1/-2 predictions) finds each of them net positive;
 # RA is left out (zero net in India, and it overlaps R1 elsewhere). Full-V cost of the package: -0.00018.
-RULES = ("R1", "RM", "RB", "W", "RF", "RL")
+RULES = ("R1", "RM", "RB", "W", "RF", "RL", "RC", "RP")
 LEGAL_SWAP_STRICT = 0.05   # RL applies where under 5% of train true copies swap the legal form (US 0.6%, India 21%)
 
 
@@ -163,6 +167,16 @@ def word_boost(tok, vocab, s1r, sxr, cols, unseen):
             & (c["num_primary_eq"] > 0.5) & (c["addr_empty_x"] < 0.5))
 
 
+def test_fake_words(tok, vocab, s1r, sxr):
+    """Pair flag: the SX name adds a word that is a fake marker in test data (TEST_FAKE_WORDS) but copy noise
+    at the exact address, so the callers apply it only at shifted / composite numbers."""
+    pos = {t: i for i, t in enumerate(vocab)}
+    ids = [pos.get(w, -1) for w in TEST_FAKE_WORDS]
+    fx = _token_flags(tok["nsx_ptr"], tok["nsx_ids"], ids)
+    f1 = _token_flags(tok["ns1_ptr"], tok["ns1_ids"], ids)
+    return (fx[sxr] & ~f1[s1r]).any(axis=1)
+
+
 def strong_fake_words(tok, vocab, s1r, sxr):
     """Pair flag: the SX name adds a word that marks a fake at any house number (STRONG_FAKE_WORDS)."""
     pos = {t: i for i, t in enumerate(vocab)}
@@ -173,7 +187,7 @@ def strong_fake_words(tok, vocab, s1r, sxr):
 
 
 def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldrop=None, unseen=None, strict=None,
-                     rw=None, xstrong=None):
+                     rw=None, xstrong=None, xpart=None, s1_legal_empty=None):
     """cols: dict of NEED_COLS arrays per pair; xleg/xword: pair flags from extra_legal/extra_words;
     ldrop: pair flag from legal_dropped; unseen: pair flag 'S1 country not in the training data' (RF only);
     strict: pair flag 'S1 country's train true copies swap legal forms under LEGAL_SWAP_STRICT' (RL only).
@@ -189,11 +203,19 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "sim": np.asarray(cols["cos_name"], dtype=np.float32) >= 0.75, "s3": np.asarray(cols["is_s3"]) > 0.5,
         "mod": (np.asarray(cols["xw_n_extra"], dtype=np.float32) > 0) | xleg, "xword": xword,
         "xleg": xleg, "ndiff": ndiff,
+        "xw_extra": np.asarray(cols["xw_n_extra"], dtype=np.float32), "mw_miss": np.asarray(cols["mw_n_miss"], dtype=np.float32),
+        "addr_empty": np.asarray(cols["addr_empty_x"], dtype=np.float32),
         "ldrop": np.zeros(n, dtype=bool) if ldrop is None else ldrop,
         "unseen": np.zeros(n, dtype=bool) if unseen is None else unseen,
         "strict": np.zeros(n, dtype=bool) if strict is None else strict,
         "rw": np.zeros(n, dtype=bool) if rw is None else rw,
         "xstrong": np.zeros(n, dtype=bool) if xstrong is None else xstrong,
+        "xpart": np.zeros(n, dtype=bool) if xpart is None else xpart,
+        "legempty": np.zeros(n, dtype=bool) if s1_legal_empty is None else s1_legal_empty,
+        "compx": (np.asarray(cols["hn_composite"], dtype=np.float32) > 0.5) & (np.asarray(cols["hn_trunc"], dtype=np.float32) < 0.5)
+                 & (np.asarray(cols["num_x_unmatched"], dtype=np.float32) >= np.asarray(cols["num_nx"], dtype=np.float32))
+                 & (np.asarray(cols["addr_empty_x"], dtype=np.float32) < 0.5),
+        "legcode": np.asarray(cols["legal_code"], dtype=np.float32),
     }).with_columns(pl.col("off").fill_nan(None))
     num = pl.col("off").is_not_null() & (pl.col("off") != 0)
     anc = (pl.col("keep") & (pl.col("p") >= tau) & (pl.col("off") == 0)).fill_null(False).cast(pl.Int32)
@@ -215,6 +237,11 @@ def lookalike_reject(s1r, p, keep, cols, xleg, xword, rules=RULES, tau=0.5, ldro
         "RF": pl.col("unseen") & off12 & (pl.col("sib1") >= 1) & (pl.col("xleg") | pl.col("ndiff")) & ~pl.col("ldrop"),
         "RL": pl.col("strict") & off12 & (pl.col("sib1") >= 1) & pl.col("xleg"),
         "RW": pl.col("rw"),
+        # composite-number fakes: legal form added (any seen country) or swapped (only where copies never swap it)
+        "RC": ~pl.col("unseen") & pl.col("compx")
+              & (((pl.col("legcode") == 2) & pl.col("legempty")) | (pl.col("strict") & (pl.col("legcode") >= 3))
+                 | (pl.col("strict") & (pl.col("xw_extra") > 0) & (pl.col("mw_miss") == 0))),
+        "RP": pl.col("strict") & pl.col("xpart") & off12 & (pl.col("off") >= 0) & (pl.col("addr_empty") < 0.5),
     }
     df = df.with_columns([(e & pl.col("keep")).fill_null(False).alias(k) for k, e in exprs.items()])
     # R1 condemns the whole (S1, number) group of the lookalike, including its copies from the other source

@@ -913,8 +913,10 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
         tok = {k: z[k] for k in ("ns1_ptr", "ns1_ids", "nsx_ptr", "nsx_ids")}
     vocab = pl.read_parquet(work("tok", f"{split}_vocab_n.parquet"))["token"].to_list()
     xword = extra_words(tok, vocab, s1r, sxr, s1["country"].to_numpy()[s1r])
-    from .lookalike import strong_fake_words
+    from .lookalike import strong_fake_words, test_fake_words
     xstrong = strong_fake_words(tok, vocab, s1r, sxr)
+    xpart = test_fake_words(tok, vocab, s1r, sxr)
+    s1_legal_empty = (s1["legal"].to_numpy() == "")[s1r]
     rw = None
     if rules and "RW" in rules:
         from .lookalike import common_word_swap
@@ -925,7 +927,7 @@ def _lookalike_post(split, s1r, sxr, X, rules=None):
     def post(p, keep):
         kw = {"rules": tuple(rules)} if rules else {}
         rej, masks = lookalike_reject(s1r, p, keep, cols, xleg, xword, ldrop=ldrop, unseen=unseen, strict=strict,
-                                      rw=rw, xstrong=xstrong, **kw)
+                                      rw=rw, xstrong=xstrong, xpart=xpart, s1_legal_empty=s1_legal_empty, **kw)
         log("lookalike rules removed", {k: int(v.sum()) for k, v in masks.items()}, "total", int(rej.sum()))
         return rej
     return post

@@ -3,12 +3,18 @@ import numpy as np
 from src.lookalike import extra_legal, lookalike_reject
 
 
-def _cols(off, ins, sib1, sibx, s3, xw=None):
+def _cols(off, ins, sib1, sibx, s3, xw=None, **extra):
+    from src.lookalike import NEED_COLS
     n = len(off)
-    return {"hn_off": np.array(off, np.float32), "hn_in_set": np.array(ins, np.float32),
-            "hn_sib_1": np.array(sib1, np.float32), "hn_sib_x": np.array(sibx, np.float32),
-            "cos_name": np.full(n, 0.9, np.float32), "xw_n_extra": np.array(xw or [0] * n, np.float32),
-            "mw_n_miss": np.zeros(n, np.float32), "is_s3": np.array(s3, np.float32)}
+    c = {"hn_off": np.array(off, np.float32), "hn_in_set": np.array(ins, np.float32),
+         "hn_sib_1": np.array(sib1, np.float32), "hn_sib_x": np.array(sibx, np.float32),
+         "cos_name": np.full(n, 0.9, np.float32), "xw_n_extra": np.array(xw or [0] * n, np.float32),
+         "mw_n_miss": np.zeros(n, np.float32), "is_s3": np.array(s3, np.float32)}
+    for k, v in extra.items():
+        c[k] = np.array(v, np.float32)
+    for k in NEED_COLS:
+        c.setdefault(k, np.zeros(n, np.float32))
+    return c
 
 
 def test_r1_same_source_conflict_takes_the_whole_group():
@@ -101,3 +107,21 @@ def test_common_word_swap_flags_only_non_typo_common_swaps():
     got = common_word_swap(tok, vocab, s1r, sxr, np.ones(4, bool))
     assert got.tolist() == [True, False, False, False]
     assert not common_word_swap(tok, vocab, s1r, sxr, np.array([False, True, True, True])).any()
+
+
+def test_rc_composite_and_rp_partners_rules():
+    # pair 0: composite number, legal added, S1 has no legal -> RC in any seen country
+    # pair 1: composite, legal swapped -> RC only where copies never swap legal forms (strict)
+    # pair 2: 'partners' swapped in at +1 -> RP (strict only); pair 3: plain truncation -> nothing
+    s1r = np.zeros(4, np.int64)
+    p = np.array([.9, .9, .9, .9], np.float32)
+    cols = _cols(off=[7, 9, 1, 0], ins=[1, 1, 1, 0], sib1=[1, 1, 1, 1], sibx=[0, 0, 0, 0], s3=[0, 0, 0, 0],
+                 hn_composite=[1, 1, 0, 0], hn_trunc=[0, 0, 0, 1], num_x_unmatched=[1, 1, 1, 0], num_nx=[1, 1, 1, 1],
+                 legal_code=[2, 3, 1, 2])
+    xpart = np.array([False, False, True, False])
+    legempty = np.array([True, False, False, True])
+    for strict, rc, rp in ((True, [True, True, False, False], [False, False, True, False]),
+                           (False, [True, False, False, False], [False, False, False, False])):
+        _, m = lookalike_reject(s1r, p, np.ones(4, bool), cols, np.zeros(4, bool), np.zeros(4, bool),
+                                strict=np.full(4, strict), xpart=xpart, s1_legal_empty=legempty)
+        assert m["RC"].tolist() == rc and m["RP"].tolist() == rp
