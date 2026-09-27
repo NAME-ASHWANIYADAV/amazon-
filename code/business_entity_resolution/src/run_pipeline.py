@@ -658,6 +658,44 @@ def stage_stage2_plus(args):
     _validate_probs(p2, "decision_s2plus.json")
 
 
+def stage_predict_stage2_plus(args):
+    """Test probabilities of the stage-2+ judge (models/judge_s2plus.json): stage-1 fold-mean p, stage-3
+    generator-structure features from it (feat/stage3_test1.parquet), within-list stage-2 features. Writes
+    pred/test_pairs_p2.parquet and makes stage 2+ the stage 2 of the later stages (V probabilities, decision)."""
+    import shutil
+
+    import xgboost as xgb
+
+    from . import judge
+    from .context import stage2_features
+    from .stage3 import NEW_F, split_features
+    tok = _load_tok("test")
+    pr = pl.read_parquet(work("pred", "test_pairs_p.parquet"), columns=["s1", "sx"])
+    s1r, sxr = pr["s1"].to_numpy(), pr["sx"].to_numpy()
+    X = np.load(work("feat", "test.npy"), mmap_mode="r")
+    assert X.shape[0] == pr.height
+    p1 = np.mean([judge.predict(xgb.Booster(model_file=work("models", f"judge_f{f}.json")), X) for f in (0, 1)], axis=0)
+    g_path = work("feat", "stage3_test1.parquet")
+    if not os.path.exists(g_path):
+        split_features("test", s1r, sxr, p1.astype(np.float32), g_path, log=log)
+    S2 = stage2_features(tok, s1r, sxr, p1)
+    del tok
+    m2 = xgb.Booster(model_file=work("models", "judge_s2plus.json"))
+    p2 = np.empty(len(p1), dtype=np.float32)
+    for b in range(0, len(p1), FEAT_CHUNK):
+        e = min(len(p1), b + FEAT_CHUNK)
+        g = pl.scan_parquet(g_path).slice(b, e - b).collect()
+        assert g["i"][0] == b
+        G = np.column_stack([g[c].to_numpy().astype(np.float32) for c in NEW_F])
+        p2[b:e] = judge.predict(m2, np.hstack([np.asarray(X[b:e], dtype=np.float32), S2[b:e], G]))
+        del g, G
+        log(f"  stage-2+ scored {e}/{len(p1)}")
+    pl.DataFrame({"s1": s1r, "sx": sxr, "p": p2}).write_parquet(work("pred", "test_pairs_p2.parquet"))
+    shutil.copyfile(work("pred", "train_V_p2plus.npy"), work("pred", "train_V_p2.npy"))
+    shutil.copyfile(work("models", "decision_s2plus.json"), work("models", "decision_s2.json"))
+    log("stage-2+ test probabilities written; stage 2+ is now the stage 2 of the pipeline")
+
+
 def stage_stage3_features(args):
     """Stage-3 generator-structure features for V (--split train) or test, from the stage-2 probabilities."""
     from .stage3 import split_features
@@ -1123,7 +1161,7 @@ STAGES = {"prepare": stage_prepare, "train-encoder": stage_train_encoder, "encod
           "stage2-final": stage_stage2_final, "stage3-features": stage_stage3_features,
           "stage3-train": stage_stage3_train, "stage3-predict": stage_stage3_predict,
           "predict-unseen": stage_predict_unseen,
-          "stage2-plus": stage_stage2_plus,
+          "stage2-plus": stage_stage2_plus, "predict-stage2-plus": stage_predict_stage2_plus,
           "features": stage_features, "train-judge": stage_train_judge,
           "validate": stage_validate, "predict-test": stage_predict_test, "rethreshold": stage_rethreshold}
 
