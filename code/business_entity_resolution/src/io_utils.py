@@ -41,6 +41,16 @@ def write_submission(out_dir, s1_ids, sx_ids, s1r, sxr, mask):
         fm.write("source1_entity_id\tmatched_entity_ids\n")
         for i, s1 in enumerate(s1_ids):
             lo, hi = bounds[i], bounds[i + 1]
-            names = sx_ids[sxs[lo:hi]]  # per-S1 slice: never materialise all ~69M names at once
+            seg, mseg = sxs[lo:hi], ms[lo:hi]
+            if hi - lo > 1:
+                # an SX can reach the same S1 twice (record pass + address pass, rule additions); the
+                # validator rejects repeated ids inside a list, so keep the first occurrence, matched if any is
+                u, first, inv = np.unique(seg, return_index=True, return_inverse=True)
+                if len(u) < len(seg):
+                    m_any = np.zeros(len(u), dtype=bool)
+                    np.logical_or.at(m_any, inv, mseg)
+                    pos = np.argsort(first, kind="stable")
+                    seg, mseg = seg[first[pos]], m_any[pos]
+            names = sx_ids[seg]  # per-S1 slice: never materialise all ~69M names at once
             fc.write(f"{s1}\t{','.join(names)}\n")
-            fm.write(f"{s1}\t{','.join(names[ms[lo:hi]])}\n")
+            fm.write(f"{s1}\t{','.join(names[mseg])}\n")
