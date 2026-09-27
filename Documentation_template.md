@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Team Name]
-**Team Members:** [Members]
+**Team Name:** GreenBytes
+**Team Members:** Lakshay Bansal, Ashwani Yadav, Arpita LNU
 **Submission Date:** 2026-09-27
 
 ---
@@ -9,10 +9,15 @@
 ## 1. Executive Summary
 
 A neural-first entity-resolution pipeline built only from the provided data. A from-scratch character n-gram
-"fingerprint" bi-encoder, trained contrastively on the 7.6M labelled pairs, maps every record to name and
-address vectors; GPU brute-force cosine search per country produces candidates; an XGBoost judge scores each
-candidate pair from ~44 similarity features; and a decision layer enforces "each Source-2/3 record belongs to
-at most one Source-1 entity" and picks, per entity, the number of matches that maximises expected F0.5.
+"fingerprint" bi-encoder, trained contrastively on the labelled pairs, maps every record to name and address
+vectors; GPU brute-force cosine search per country produces candidates (record pass + address-only pass); a
+cheap stage-A filter prunes them to ~9 pairs per entity; a stacked XGBoost judge (stage 1, then stage 2 on
+within-list context) scores each pair from 71 features, including generator-aware ones (house-number shift
+alignment, sibling agreement, word log-odds, cross-entity competition); a stage-3 recalibrator adds
+generator-structure features (per-source address base, co-location, duplicates); and a decision layer enforces
+"each Source-2/3 record belongs to at most one Source-1 entity", picks per entity the number of matches that
+maximises exact expected F0.5, and removes lookalike fake groups with rules derived from the generator's
+regularities. Validation macro F0.5 (10% held-out entities): 0.9881. Public leaderboard: 0.975 (U2: see §5).
 
 ---
 
@@ -22,79 +27,64 @@ at most one Source-1 entity" and picks, per entity, the number of matches that m
 
 Key findings from EDA (train: 2.21M S1, 10.3M S2+S3; test: 1.73M S1, 9.97M S2+S3):
 
-- **One owner per record:** every S2/S3 id belongs to at most one S1 entity (0 exceptions in 7.64M labelled pairs). We use this as a hard assignment constraint.
-- **Matches per entity:** singletons are 5.6% of S1. The mean is 3.46 matches per S1 (1.8 from S2, 1.9 from S3), max 11. Recall matters as much as precision.
-- **Distractors:** 26% of S2/S3 records match no S1. The test set has 5.7 S2+S3 records per S1 against 4.67 in train, so it holds more distractors.
-- **Signal coverage:** 99.8% of true pairs share a name token, the house number, or at least two address words.
-- **Lookalike negatives:** non-matches that share a rare name token share the house number only 0.1% (US) / 3% (India) of the time. The hardest ones sit on the same street with a shifted number and one extra descriptor word ("Sidynis Holdings Group **South** LLC, **1420** Prairie Creek Trl" vs "Sidynis Holdings Group LLC, 1417 Prairie Creek Trail").
-- **Name noise:** accents, brackets, typos and scrambled letters, domain names, "formerly:"/DBA trade names, phone numbers, honorifics, legal forms that are added, dropped or moved, and duplicated or dropped tokens.
-- **Indic scripts:** 18% of India S2/S3 names are written in Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Tamil, Telugu, Kannada or Malayalam. They are phonetic transliterations of the English name.
-- **Address noise:** abbreviations, typos, reordered components, null/N/A tokens, zero padding, state codes vs full names vs native script, and 3-5% empty addresses.
-- **France:** appears only in test (15% of test S1), with French abbreviations (R., AV, BD, N°) and legal forms (SARL, SAS, EURL, SCI). Names are built from generic words, so the address carries most of the evidence.
+- **One owner per record:** every S2/S3 id belongs to at most one S1 entity (0 exceptions in 7.64M labelled pairs). Used as a hard assignment constraint.
+- **Matches per entity:** singletons are 5.6% of S1; the mean is 3.46 matches per S1 in both train countries (max 5 from S2, 6 from S3, 11 in total). Recall matters as much as precision.
+- **Distractors:** 26% of train S2/S3 records match no S1 (1.2 per S1); test has ~2.3 per S1. Their house numbers are shifted UP by {1,2,3,4,5,7,9,11,13,21} and their names carry descriptor words (group, holdings, india, participations, france) or changed legal forms. True copies get ±1/2 number typos (sign-symmetric). In test, fakes come in groups of 1–3 copies at the same shifted number, which a judge trained on single train fakes reads as agreement.
+- **Name noise:** accents, typos and scrambled letters, domain names, "formerly:"/DBA trade names, made-up brand words from a global pool, phone numbers, honorifics, acronyms (France: 13x more), legal forms added/dropped/changed, dropped spaces.
+- **Indic scripts:** 18% of India S2/S3 names are phonetic transliterations in nine Brahmic scripts.
+- **Address noise:** abbreviations, typos, reordered components, null tokens, zero padding, state codes vs names, 3–5% empty addresses. Empty-address copies cause 66% of validation false negatives: their name alone is shared by several S1s, an irreducible tie.
+- **France:** test only (15% of test S1). French abbreviations (R., AV, BD, Q, N°) and legal forms; names built from generic words (club, amicale, comité, école) that swap between copies; 15.8% of S1s share an exact address with another S1.
 
 ### 2.2 Solution Strategy
 
-**Approach Type:** Neural bi-encoder blocking + gradient-boosted pair classifier + constrained decision layer.
-**Core Innovation:** a from-scratch, script-agnostic hashed n-gram bi-encoder with separate name/address
-towers (typo-, order- and transliteration-robust, millions of records per second on a 4 GB GPU), combined with
-an exact expected-F0.5 per-entity cut under the one-owner constraint.
+**Approach Type:** Neural bi-encoder blocking + stacked gradient-boosted pair classifier + generator-aware rules + constrained decision layer.
+**Core Innovation:** treating the synthetic generator as the object to model: features and rules encode its regularities (distractor shift set, per-source address base, sibling agreement, dual-role words), a simulated competitor table gives every SX its real competition, and an exact expected-F0.5 cut under the one-owner constraint turns calibrated probabilities into matches. No country is hard-coded: unseen-country behaviour is keyed on "country absent from training".
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-- **Normalisation** (hand-written language rules, no lookups):
-  - One Brahmic transliteration table covering all nine Indian scripts. They share a Unicode layout, and the table handles inherent-vowel and schwa rules.
-  - Accent folding, legal-form extraction, honorific and phone-number removal, domain and "formerly/DBA" handling.
-  - Street, French and Indian abbreviation expansion, state-code canonicalisation, number extraction.
-- **Fingerprint encoder:**
-  - Every word and every padded char 3/4-gram is hashed into 2^21 buckets, then passed through an EmbeddingBag with a learned per-bucket weight.
-  - A small MLP tower per field (name, address) produces two 64-d unit vectors. The record vector is their normalised concatenation.
-  - Training uses symmetric InfoNCE with in-batch negatives: 8 epochs, batch 8192, one random S2/S3 record per S1 per epoch, on 75% of train entities.
-  - In-batch top-1 accuracy reached 99.9%.
-- **Search:**
-  - Exact cosine top-40 per S1 within the same country, brute force on the GPU in chunks (~2.5 G pairs/s).
-  - Empty-address records are rescaled so that their score is not capped at 1/√2.
-- **Candidate pairs:** 69.3M on test (1,732,544 × 40).
-- **Recall ceiling (validation):** 98.3% of true pairs are within the top 40. Most of the misses have an unrelated trade name with the same address. [update after Phase 2 address-only search]
+- **Normalisation** (hand-written rules, no lookups): one Brahmic transliteration table for nine scripts; accent folding; legal-form extraction (US/India/France forms); honorific, phone and domain handling; street, French and Indian abbreviation expansion; state-code canonicalisation; number extraction.
+- **Fingerprint encoder:** every word and padded char 3/4-gram hashed into 2^20 buckets → EmbeddingBag with learned bucket weights → one MLP tower per field (name, address) → two 64-d unit vectors, concatenated. Symmetric InfoNCE with in-batch negatives, 8 epochs, batch 8192, trained on 75% of train entities (split E). In-batch top-1 accuracy 99.9%.
+- **Search:** exact cosine top-40 per S1 within the same country (brute force on the GPU, ~2.5 G pairs/s) plus a top-10 address-cosine pass that recovers trade-name copies. Empty-address records are rescaled so their score is not capped at 1/√2.
+- **Stage-A filter:** a small XGBoost on list/competition features keeps 99.9% of true pairs while pruning 79M test pairs to 15.1M (8.7 per S1). `candidate_pairs.tsv` holds these survivors, the pairs the judges score.
+- **Recall ceiling (validation):** 99.6% of true pairs are among the scored candidates (98.3% without the address pass).
 
 ---
 
 ## 4. Matching Model
 
-**Features used (44):**
-- **Neural:** record, name and address cosines; rank in the S1 list; gap to the best candidate; z-score within the list; list size.
-- **Name:**
-  - token intersection, Jaccard, containment both ways, IDF-weighted Jaccard and overlap
-  - token-set, token-sort, partial and plain ratios, space-free ratio, Jaro-Winkler
-  - best score over formerly/DBA alternatives
-  - legal-form agreement code
-  - transliterated-script flag, domain-name flag
-- **Address:**
-  - word intersection, Jaccard, IDF-weighted Jaccard, token-set and plain ratios
-  - house numbers: primary equal, any equal, minimum and relative difference, primary-to-primary difference, unmatched numbers, number counts
-  - empty-address flag
-- **Other:** source (S2 vs S3).
+**Features (71 per pair):**
+- **Neural / list:** record, name and address cosines; rank; gap to best; z-score in list; list size.
+- **Name:** token overlap (plain, containment, IDF-weighted per country), token-set/sort/partial/plain ratios, space-free ratio, Jaro-Winkler, best score over DBA alternatives, legal-form agreement code, acronym flag, transliteration and domain flags.
+- **Address:** token overlap and ratios; house numbers (primary/any equality, differences, unmatched numbers); empty-address flag.
+- **Competition:** for the same SX, how this S1 compares with every other S1 whose list holds it (computed against a fixed competitor table so train sees the competition test has).
+- **Generator context:** aligned house-number offset and whether it is in the distractor shift set / negative / truncated / composite; sibling counts at the same number; empty-address duplicates; global name multiplicity (size-normalised per country); descriptor-word log-odds (extra/missing words), transferred to test tokens through the vocabulary with a French→English equivalence table; stage-A probability.
+- **Stage 2:** within-list statistics of the out-of-fold stage-1 probabilities (confident copies per source, rank, mass of competitors).
+- **Stage 3:** per-source address base (extra numbers/address tokens not shared by any confident same-source copy), co-located S1 counts at both addresses, exact duplicates in the list, name-edit type (typo / concatenation / novel word / replacement).
 
-**Model type:** XGBoost (hist, CUDA), trained on the candidate pairs of 15% of train entities. None of these entities were used for the encoder. Early stopping uses a held-out slice of those entities.
-**Threshold selection method:**
+**Model type:** XGBoost (hist, CUDA) for stages A/1/2, trained on the candidate pairs of 15% of train entities (split J, never used for the encoder) with early stopping on a held-out slice; LightGBM stage-3 recalibrator trained on the 10% validation split (V) with 5-fold grouped CV (+0.0012 V).
+
+**Decision:**
 1. Assignment: each S2/S3 record is kept only for its highest-probability S1.
-2. Per-entity cut: the top-k is chosen by exact expected F0.5, computed with a Poisson-binomial model plus a Poisson tail for lower-ranked candidates. k = 0 when "no match" is the better bet.
-3. This rule is compared with global thresholds on a 10% validation split and on a stress view with 19% of entities removed.
+2. Lookalike rules (measured on V, cost < 0.0002): reject a +1/+2 copy from the same source as a confident copy at the S1 number (and its whole number group); reject shifted groups mixing S2 and S3, or whose members all only add a legal form/descriptor; reject fake descriptor words at shifted numbers; in unseen countries reject +1/+2 copies with a changed word/legal form and common-word swaps at the same number.
+3. Per-entity cut: top-k by exact expected F0.5 (Poisson-binomial with a Poisson tail), k = 0 when "no match" is the better bet; per-source caps 5/6.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F0.5 Score (macro, validation):** [fill]
-- **Common false positives:** [fill after error analysis]
-- **Common false negatives:** mainly pairs where the S2/S3 name is an unrelated trade name and only the address links the records (outside the top-40 shortlist). [fill]
+- **Validation macro F0.5 (V, 221k entities):** stage 1 0.9863 → stage 2 0.9869 → stage 3 0.9881 (US 0.9890, India 0.9868). Pair precision 0.997, recall 0.968.
+- **Public leaderboard:** 0.963 (v1) → 0.971 (shift rule) → 0.975 (stage 2 + lookalike rules) → [final].
+- **Common false positives (test):** lookalike fake groups at shifted house numbers with a legal-form change ('little diner inc / co / ltd | 4311' for 'little diner | 4310'); brand-only copies of a co-located entity. Test has ~2x the train distractor rate and fakes come in groups, which is the main validation-to-leaderboard gap; the rules and stage 3 recover about half of it.
+- **Common false negatives:** empty-address copies whose name is shared by several S1s (76% of them irreducible ties on the available data); French acronym and abbreviation copies.
+- **What did not help (measured on V):** a character-level cross-encoder blend (+0.00001), transitive rare-token links (0), count priors and joint assignment (< 0.0002), hyper-parameter sweeps (−0.001), training with simulated missing S1s (test has none: source-balance z-test).
 
 ---
 
 ## 6. Conclusion
 
-[fill]
+The synthetic generator has strong regularities; modelling them (shift set, per-source base, sibling agreement, dual-role words) mattered more than model capacity. The largest remaining losses are intrinsic ties between identically named entities and the unseen-country shift for France.
 
 ---
 
@@ -102,11 +92,14 @@ an exact expected-F0.5 per-entity cut under the one-owner constraint.
 
 ### A. Code Artefacts
 
-`code/business_entity_resolution/`: `src/` (normalize, featurize, encoder, candidates, features, judge, decide,
-evaluate, io_utils, run_pipeline), `tests/` (pytest), `README.md` (exact stage-by-stage commands), `requirements.txt`.
-Entry point: `python -m src.run_pipeline <stage>`. Stages: prepare, train-encoder, encode, candidates, tokens,
-features, train-judge, validate, predict-test.
+`code/business_entity_resolution/`: `src/` (normalize, featurize, encoder, candidates, features, context,
+judge, stage3, decide, lookalike, evaluate, io_utils, run_pipeline, cross_encoder), `tests/` (61 pytest tests),
+`README.md` (exact stage-by-stage commands and flags), `requirements.txt`. Entry point:
+`python -m src.run_pipeline <stage>`.
 
 ### B. Additional Results
 
-[fill]
+Label-free checks used to choose between submissions without spending uploads: per-country predictions per S1
+against the validation level (3.36), the sign-symmetry of ±1/2 house-number offsets (true typos are symmetric,
+fakes are +only), p-bin mass per country, and an address-style fingerprint (number format, region rendering)
+that agrees 99% within an entity and 3% between entities.
