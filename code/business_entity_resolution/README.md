@@ -70,7 +70,7 @@ recomputing features; its flags:
 | `--stage2` / `--stage3` | use the stage-2 / stage-3 probabilities |
 | `--rule expected_f` | per-S1 exact expected-F0.5 cut (`--rule threshold --thr T` for a global threshold) |
 | `--shift-rule` | never match an SX whose house number is the S1's plus a distractor shift >= 3 while copies confirm the S1 number |
-| `--lookalike` | drop lookalike fake groups after assignment (`src/lookalike.py`, rules R1/RM/RB/W/RF/RL by default; `--rules R1,RM,RB,W,RF,RL,RW` adds the common-word-swap rule for unseen countries) |
+| `--lookalike` | drop lookalike fake groups after assignment (`src/lookalike.py`, rules R1/RM/RB/W/RF/RL/RC/RP by default: same-source anchor conflict, mixed-source groups, all-modified groups, fake words, unseen-country +1/+2 changes, legal swaps where copies never swap, composite shift+truncation numbers, 'partners' at +1/+2; `--rules ...,RW` adds the common-word-swap rule for unseen countries) |
 | `--caps` | at most 5 S2 and 6 S3 matches per S1 (train truth maximum) |
 | `--word-boost` | in unseen countries, raise exact-address copies whose only extra word is a dual-role word (groupe / developpement / france) |
 | `--style-add` | in unseen countries, add unmatched same-number copies whose raw address style (number format, region rendering) agrees with the S1's confident same-source copies (`src/style.py`) |
@@ -88,7 +88,7 @@ recomputing features; its flags:
 | `src/features.py` | token arrays, per-country idf, 45 pair features + competition features, acronym flag |
 | `src/context.py` | generator-aware context: house-number alignment vs the distractor shift set, sibling counts, global name counts, word log-odds; stage-2 within-list features |
 | `src/judge.py` | XGBoost (CUDA) classifiers (stage A, stage 1, stage 2) |
-| `src/stage3.py` | stage-3 recalibrator: per-source address base, co-location, duplicates, name-edit type (LightGBM on V) |
+| `src/stage3.py` | generator-structure features (per-source address base, co-location counts over all S1s, duplicates, name-edit type, digit-level house-number edit) used inside the stage-2+ judge and by the stage-3 mid-band recalibrator (LightGBM on V) |
 | `src/decide.py` | assignment (each SX to one S1), exact expected-F0.5 cut, threshold rule |
 | `src/lookalike.py` | lookalike-group rules (same-source anchor conflict, mixed-source groups, all-modified groups, fake words, unseen-country rules), word boost |
 | `src/style.py` | address-rendering style from the raw text, name-edit categories, street mismatch, style-agreement additions |
