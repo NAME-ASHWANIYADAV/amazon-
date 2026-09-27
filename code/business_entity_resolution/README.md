@@ -12,7 +12,9 @@ training data".
 
 - Windows or Linux, Python 3.12, an NVIDIA GPU with CUDA (tested: GTX 1650 4 GB), ~16 GB RAM, ~25 GB disk.
 - `pip install -r requirements.txt` (torch CUDA wheel: `--index-url https://download.pytorch.org/whl/cu126`).
-- All libraries are MIT/Apache/BSD licensed; the largest model is the 0.5 GB fingerprint encoder.
+- All libraries are MIT/Apache/BSD licensed. Models: the team's own 0.5 GB fingerprint encoder, XGBoost/LightGBM
+  judges, and `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` (Apache-2.0, 118M parameters, downloaded from
+  Hugging Face by `ce-train` and fine-tuned on the training pairs; no other external data).
 
 ## Data layout
 
@@ -52,6 +54,8 @@ python -m src.run_pipeline stage3-features --split J        # generator-structur
 python -m src.run_pipeline stage3-features --split V1
 python -m src.run_pipeline stage2-plus                      # stage-2 judge with those features (V +0.0013)
 python -m src.run_pipeline predict-stage2-plus              # its test probabilities (becomes the pipeline's stage 2)
+python -m src.run_pipeline ce-train --epochs 1 --ce-pairs 120000   # multilingual MiniLM cross-encoder on the J grey zone (GPU, ~1 h)
+python -m src.run_pipeline ce-apply                         # re-scores the test grey zone and blends it into stage 2 (V +0.0010)
 python -m src.run_pipeline stage3-features --split train    # generator-structure features on V (stage-2 view)
 python -m src.run_pipeline stage3-train                     # stage-3 recalibrator (LightGBM on V)
 python -m src.run_pipeline stage3-features --split test
@@ -95,4 +99,6 @@ recomputing features; its flags:
 | `src/evaluate.py` | organizer macro F0.5 |
 | `src/io_utils.py` | TSV reading, streaming submission writer |
 | `src/run_pipeline.py` | CLI stages above |
-| `src/cross_encoder.py` | character-level cross-encoder experiment (no gain on validation; not used in the final run) |
+| `src/cross_encoder_pt.py` | pretrained multilingual MiniLM cross-encoder: fine-tuning on grey-zone pairs, batched scoring, logistic blend with the judge |
+| `src/unseen.py` | transductive adaptation for countries absent from training (pseudo word log-odds, self-training); evaluated, not used in the final run |
+| `src/cross_encoder.py` | character-level cross-encoder trained from scratch (no gain on validation; not used in the final run) |

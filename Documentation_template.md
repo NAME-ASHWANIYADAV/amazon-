@@ -63,7 +63,7 @@ Key findings from EDA (train: 2.21M S1, 10.3M S2+S3; test: 1.73M S1, 9.97M S2+S3
 - **Stage 2:** within-list statistics of the out-of-fold stage-1 probabilities (confident copies per source, rank, mass of competitors).
 - **Stage 3:** per-source address base (extra numbers/address tokens not shared by any confident same-source copy), co-located S1 counts at both addresses, exact duplicates in the list, name-edit type (typo / concatenation / novel word / replacement).
 
-**Model type:** XGBoost (hist, CUDA) for stages A/1/2, trained on the candidate pairs of 15% of train entities (split J, never used for the encoder) with early stopping on a held-out slice; LightGBM stage-3 recalibrator trained on the 10% validation split (V) with 5-fold grouped CV (+0.0012 V).
+**Model type:** XGBoost (hist, CUDA) for stages A/1/2+, trained on the candidate pairs of 15% of train entities (split J, never used for the encoder) with early stopping on a held-out slice; a pretrained multilingual MiniLM cross-encoder (Apache-2.0, 118M parameters) fine-tuned on the J grey zone re-scores the pairs the judge is unsure about and is blended in logistically (V +0.0010, the largest single gain: it reads the raw text and knows French words); LightGBM stage-3 recalibrator on generator-structure features trained on the 10% validation split (V) with 5-fold grouped CV (+0.0005 V).
 
 **Decision:**
 1. Assignment: each S2/S3 record is kept only for its highest-probability S1.
@@ -74,7 +74,7 @@ Key findings from EDA (train: 2.21M S1, 10.3M S2+S3; test: 1.73M S1, 9.97M S2+S3
 
 ## 5. Results & Error Analysis
 
-- **Validation macro F0.5 (V, 221k entities):** stage 1 0.9862 → stage 2 0.9870 → stage 2+ (generator-structure features inside the judge) 0.9883 → stage-3 recalibrator 0.9888 (US 0.9896, India 0.9877). Pair precision 0.998, recall 0.969.
+- **Validation macro F0.5 (V, 221k entities):** stage 1 0.9862 → stage 2 0.9870 → stage 2+ (generator-structure features inside the judge) 0.9883 → + cross-encoder blend 0.9893 → + stage-3 recalibrator ≈0.9898. Pair precision 0.998, recall 0.970.
 - **Public leaderboard:** 0.963 (v1) → 0.971 (shift rule) → 0.975 (stage 2 + lookalike rules) → 0.977 (stage 3, France fixes) → 0.978 (stage 2+, raw name counts, France additions) → [final].
 - **Common false positives (test):** lookalike fake groups at shifted house numbers with a legal-form change ('little diner inc / co / ltd | 4311' for 'little diner | 4310'); brand-only copies of a co-located entity. Test has ~2x the train distractor rate and fakes come in groups, which is the main validation-to-leaderboard gap; the rules and stage 3 recover about half of it.
 - **Common false negatives:** empty-address copies whose name is shared by several S1s (76% of them irreducible ties on the available data); French acronym and abbreviation copies.
