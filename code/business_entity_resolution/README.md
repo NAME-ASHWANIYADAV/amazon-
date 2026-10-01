@@ -31,7 +31,7 @@ Set paths with environment variables (defaults in `src/config.py`):
 From this folder (`code/business_entity_resolution`), with `USE_TF=0` in the environment:
 
 ```bash
-python -m pytest tests -q                                   # unit tests (61)
+python -m pytest tests -q                                   # unit tests (73)
 python -m src.run_pipeline prepare                          # normalise all records, E/J/V split, GT rows
 python -m src.run_pipeline train-encoder                    # contrastive bi-encoder on split E (GPU)
 python -m src.run_pipeline encode --split train             # fingerprints for train records
